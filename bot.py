@@ -12,6 +12,7 @@ Key design choices for Railway free tier survival:
     - Downloaded files are ALWAYS removed in a `finally` block, even on error.
     - Explicit `gc.collect()` after every upload cycle.
     - SQLite (file-based, zero extra services) for quota + admin tracking.
+    - Browser-like headers + extractor args to bypass Railway IP blocks.
 """
 
 import os
@@ -48,14 +49,17 @@ ADMIN_CODE = os.environ.get("ADMIN_CODE", "1169")
 BOT_DEV = "Anas"
 SUPPORT_URL = os.environ.get("SUPPORT_URL", "https://t.me/DevAnas")
 
-DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
-DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
+DB_PATH = os.environ.get("DB_PATH", "/tmp/bot_data.db")
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/downloads")
 
 MAX_DAILY_DOWNLOADS = 2                 # standard users
 MAX_FILE_SIZE_MB = 50                   # Telegram Bot API hard cap for uploads
 MAX_DURATION_SECONDS = 30 * 60          # 30 minutes safety cap
 MAX_RESOLUTION_FORMAT = (
-    "bestvideo[height<=720]+bestaudio/best[height<=720]/best[height<=720]"
+    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+    "/bestvideo[height<=720]+bestaudio"
+    "/best[height<=720]"
+    "/best"
 )
 MAX_CONCURRENT_DOWNLOADS = 1            # keep RAM usage predictable on free tier
 
@@ -77,6 +81,37 @@ download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 # "Live Status" inline button so it can answer with a fresh popup.
 # key: (chat_id, message_id) -> str
 active_status_text = {}
+
+# --------------------------------------------------------------------------- #
+# yt-dlp shared options (browser spoofing to bypass Railway IP blocks)
+# --------------------------------------------------------------------------- #
+
+YTDLP_BASE_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "socket_timeout": 30,
+    # Impersonate a real browser so YouTube doesn't block datacenter IPs
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+    # Use Android client — much less restricted than web client on server IPs
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+            "skip": ["hls", "dash"],
+        }
+    },
+    "retries": 5,
+    "fragment_retries": 5,
+    "ignoreerrors": False,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -217,11 +252,8 @@ async def set_status(message, chat_id: int, text: str, keyboard=None):
 
 def _extract_info_sync(url: str) -> dict:
     opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
+        **YTDLP_BASE_OPTS,
         "skip_download": True,
-        "socket_timeout": 20,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -229,21 +261,35 @@ def _extract_info_sync(url: str) -> dict:
 
 def _download_sync(url: str, output_template: str) -> str:
     opts = {
+        **YTDLP_BASE_OPTS,
         "format": MAX_RESOLUTION_FORMAT,
         "merge_output_format": "mp4",
         "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
         "restrictfilenames": True,
         "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
-        "socket_timeout": 30,
-        "retries": 3,
         "concurrent_fragment_downloads": 1,
+        # Postprocessor: ensure mp4 output via ffmpeg
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }
+        ],
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+        # yt-dlp may change extension after merge — get the real filename
+        filename = ydl.prepare_filename(info)
+        # If the merged file is .mp4 already, return it
+        if os.path.exists(filename):
+            return filename
+        # Fallback: look for any file matching the safe_name prefix
+        base = os.path.splitext(filename)[0]
+        for ext in ("mp4", "mkv", "webm", "avi"):
+            candidate = f"{base}.{ext}"
+            if os.path.exists(candidate):
+                return candidate
+        return filename
 
 
 async def extract_info(url: str) -> dict:
@@ -404,7 +450,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with download_semaphore:
             # ---- Validate video before downloading ---- #
             try:
-                info = await asyncio.wait_for(extract_info(url), timeout=30)
+                info = await asyncio.wait_for(extract_info(url), timeout=45)
             except asyncio.TimeoutError:
                 await set_status(
                     status_msg,
