@@ -346,7 +346,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg = f"⏬ **Downloading...**\n\n📊 *Progress:* `{percent}`\n📁 *Downloaded:* `{downloaded:.1f}MB / {total_mb:.1f}MB`"
                     asyncio.run_coroutine_threadsafe(status_msg.edit_text(msg, parse_mode="Markdown"), asyncio.get_event_loop())
 
-             base_ydl_opts = {
+        base_ydl_opts = {
             'outtmpl': 'downloads/%(id)s.%(ext)s',
             'quiet': True,
             'no_warnings': True,
@@ -362,10 +362,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'Accept-Language': 'en-US,en;q=0.9',
             }
         }
+
         if os.path.exists("cookies.txt"):
             base_ydl_opts['cookiefile'] = "cookies.txt"
 
-        # 🛠️ ULTIMATE UNIVERSAL FORMAT FALLBACK (Fixes All Format Errors)
+        # 🛠️ ULTIMATE UNIVERSAL FORMAT FALLBACK
         if query.data == "dl_audio":
             ydl_opts = {
                 **base_ydl_opts,
