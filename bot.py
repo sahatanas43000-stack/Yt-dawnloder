@@ -31,10 +31,9 @@ CHANNEL_2_URL = "https://t.me/sahatanass"
 OTHER_BOT_URL = "https://t.me/BomssssssssBot"
 
 DB_FILE = "user_data.db"
-MAX_FILE_SIZE_MB = 100  # Protect Render 500MB RAM limit
+MAX_FILE_SIZE_MB = 100
 REFERRAL_THRESHOLD_FOR_UNLIMITED = 100
 
-# SQLite Database Setup
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -156,6 +155,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("⚡ Any Video Downloader Bot", url=OTHER_BOT_URL)]
     ])
 
+# ✅ সুন্দর নতুন /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user.id)
@@ -167,8 +167,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 add_referral(referrer_id)
                 try:
                     await context.bot.send_message(
-                        chat_id=referrer_id, 
-                        text=f"🎉 **New Referral!** User `{user.first_name}` joined using your link.",
+                        chat_id=referrer_id,
+                        text=(
+                            f"🎉 *নতুন Referral!*\n\n"
+                            f"👤 `{user.first_name}` তোমার link দিয়ে join করেছে!\n"
+                            f"✅ তোমার referral count বাড়ছে।"
+                        ),
                         parse_mode="Markdown"
                     )
                 except Exception:
@@ -181,16 +185,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_dl, ref_count = get_user_stats(user.id)
     is_prem, status_str = is_user_premium(user.id)
 
+    # Status badge
+    if user.id == ADMIN_ID:
+        badge = "👑 Admin"
+        status_line = "♾️ Unlimited Access"
+    elif is_prem:
+        badge = "⭐ Premium"
+        status_line = f"✅ {status_str}"
+    else:
+        badge = "🆓 Free"
+        status_line = f"📥 Today: {today_dl}/2 downloads used"
+
+    # Referral progress bar
+    filled = int((ref_count / REFERRAL_THRESHOLD_FOR_UNLIMITED) * 10)
+    empty = 10 - filled
+    progress_bar = "🟩" * filled + "⬜" * empty
+
     msg = (
-        f"👋 **Hi {user.first_name}!**\n\n"
-        f"Welcome to **YouTube Downloader Bot** 🚀\n\n"
-        f"👤 **Account Status:** `{status_str}`\n"
-        f"👥 **Your Referrals:** `{ref_count}/{REFERRAL_THRESHOLD_FOR_UNLIMITED}`\n"
-        f"*(Invite 100 friends to get Lifetime Unlimited Free Access!)*\n\n"
-        f"🔗 **Your Referral Link:**\n`{ref_link}`\n\n"
-        f"📩 Send me any YouTube Link to download!"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🎬 *YouTube Downloader Bot*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👋 *Welcome, {user.first_name}!*\n\n"
+        f"┌ 🏷️ *Account:* `{badge}`\n"
+        f"├ 📊 *Status:* `{status_line}`\n"
+        f"└ 🕐 *Today's Downloads:* `{today_dl}/{'∞' if is_prem else '2'}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 *Referral Progress*\n"
+        f"{progress_bar} `{ref_count}/{REFERRAL_THRESHOLD_FOR_UNLIMITED}`\n"
+        f"🎯 _{REFERRAL_THRESHOLD_FOR_UNLIMITED - ref_count} জন আনলে Lifetime Unlimited!_\n\n"
+        f"🔗 *তোমার Referral Link:*\n"
+        f"`{ref_link}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📩 *যেকোনো YouTube link পাঠাও!*\n"
+        f"⬇️ 360p • 480p • 720p • 1080p • MP3"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
+    )
 
 async def add_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -202,13 +236,14 @@ async def add_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id, referral_count) VALUES (?, 0)", (target_id,))
         c.execute("UPDATE users SET premium_until=? WHERE user_id=?", (exp_time, target_id))
         conn.commit()
         conn.close()
 
         await update.message.reply_text(f"✅ User `{target_id}` set to Premium for {days} days!", parse_mode="Markdown")
     except (IndexError, ValueError):
-        await update.message.reply_text("❌ Usage: `/add_premium <user_id> <days>`\nExample: `/add_premium 123456789 30`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Usage: `/add_premium <user_id> <days>`", parse_mode="Markdown")
 
 async def remove_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -221,7 +256,7 @@ async def remove_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        await update.message.reply_text(f"🗑️ Premium status removed for user `{target_id}`!", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑️ Premium removed for `{target_id}`!", parse_mode="Markdown")
     except (IndexError, ValueError):
         await update.message.reply_text("❌ Usage: `/remove_premium <user_id>`", parse_mode="Markdown")
 
@@ -327,30 +362,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_path = None
     try:
-        last_update = 0
+        last_update = [0]
+
         def progress_hook(d):
-            nonlocal last_update
             if d['status'] == 'downloading':
                 curr_time = asyncio.get_event_loop().time()
-                if curr_time - last_update > 2.5:
-                    last_update = curr_time
+                if curr_time - last_update[0] > 2.5:
+                    last_update[0] = curr_time
                     downloaded = d.get('downloaded_bytes', 0) / (1024 * 1024)
                     total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
                     total_mb = total / (1024 * 1024) if total else 0
-                    
+
                     is_prem, _ = is_user_premium(user_id)
                     if total_mb > MAX_FILE_SIZE_MB and not is_prem:
                         raise Exception(f"File size exceeds free limit of {MAX_FILE_SIZE_MB}MB!")
-                    
+
                     percent = d.get('_percent_str', '0%').strip()
-                    msg = f"⏬ **Downloading...**\n\n📊 *Progress:* `{percent}`\n📁 *Downloaded:* `{downloaded:.1f}MB / {total_mb:.1f}MB`"
-                    asyncio.run_coroutine_threadsafe(status_msg.edit_text(msg, parse_mode="Markdown"), asyncio.get_event_loop())
+                    msg_text = f"⏬ **Downloading...**\n\n📊 *Progress:* `{percent}`\n📁 *Downloaded:* `{downloaded:.1f}MB / {total_mb:.1f}MB`"
+                    asyncio.run_coroutine_threadsafe(
+                        status_msg.edit_text(msg_text, parse_mode="Markdown"),
+                        asyncio.get_event_loop()
+                    )
 
         base_ydl_opts = {
             'outtmpl': 'downloads/%(id)s.%(ext)s',
             'quiet': True,
             'no_warnings': True,
             'progress_hooks': [progress_hook],
+            'merge_output_format': 'mp4',
             'extractor_args': {
                 'youtube': {
                     'player_client': ['android', 'ios', 'web'],
@@ -366,7 +405,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists("cookies.txt"):
             base_ydl_opts['cookiefile'] = "cookies.txt"
 
-        # 🛠️ ULTIMATE UNIVERSAL FORMAT FALLBACK
         if query.data == "dl_audio":
             ydl_opts = {
                 **base_ydl_opts,
@@ -374,23 +412,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
             }
         elif query.data == "dl_360":
-            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=360]+bestaudio/best[height<=360]/best'}
+            ydl_opts = {
+                **base_ydl_opts,
+                'format': (
+                    'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]'
+                    '/bestvideo[height<=360]+bestaudio'
+                    '/best[height<=360]'
+                    '/best'
+                )
+            }
         elif query.data == "dl_480":
-            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'}
+            ydl_opts = {
+                **base_ydl_opts,
+                'format': (
+                    'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]'
+                    '/bestvideo[height<=480]+bestaudio'
+                    '/best[height<=480]'
+                    '/best'
+                )
+            }
         elif query.data == "dl_720":
-            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'}
+            ydl_opts = {
+                **base_ydl_opts,
+                'format': (
+                    'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]'
+                    '/bestvideo[height<=720]+bestaudio'
+                    '/best[height<=720]'
+                    '/best'
+                )
+            }
         elif query.data == "dl_1080":
-            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'}
+            ydl_opts = {
+                **base_ydl_opts,
+                'format': (
+                    'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]'
+                    '/bestvideo[height<=1080]+bestaudio'
+                    '/best[height<=1080]'
+                    '/best'
+                )
+            }
 
         os.makedirs("downloads", exist_ok=True)
-
         loop = asyncio.get_event_loop()
+
         def download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
                 if query.data == "dl_audio":
                     filename = os.path.splitext(filename)[0] + ".mp3"
+                elif not os.path.exists(filename):
+                    base = os.path.splitext(filename)[0]
+                    for ext in ['.mp4', '.mkv', '.webm']:
+                        if os.path.exists(base + ext):
+                            filename = base + ext
+                            break
                 return filename, info.get('title', 'Media')
 
         file_path, title = await loop.run_in_executor(None, download)
@@ -424,7 +500,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Download Error: {e}")
-        await status_msg.edit_text(f"❌ **Failed to process video.**\n\nError: `{str(e)[:150]}`", parse_mode="Markdown")
+        err_text = str(e)[:200]
+        await status_msg.edit_text(
+            f"❌ **Download Failed!**\n\n`{err_text}`\n\n"
+            f"💡 Try a different quality or check if the video is age-restricted.",
+            parse_mode="Markdown"
+        )
 
     finally:
         if file_path and os.path.exists(file_path):
@@ -439,7 +520,15 @@ def main():
         print("CRITICAL: Set BOT_TOKEN environment variable!")
         return
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add_premium", add_premium))
@@ -449,7 +538,11 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    application.run_polling(drop_pending_updates=True)
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False
+    )
 
 if __name__ == "__main__":
     main()
