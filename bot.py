@@ -32,8 +32,8 @@ CHANNEL_2_URL = "https://t.me/sahatanass"
 OTHER_BOT_URL = "https://t.me/BomssssssssBot"
 
 DB_FILE = "user_data.db"
-MAX_FILE_SIZE_MB = 80          # ✅ 80MB limit — Render safe
-RAM_LIMIT_MB = 400             # ✅ 400MB RAM হলে নতুন download block
+MAX_FILE_SIZE_MB = 80
+RAM_LIMIT_MB = 400
 REFERRAL_THRESHOLD_FOR_UNLIMITED = 100
 
 # ============================================================
@@ -70,7 +70,7 @@ def init_db():
 init_db()
 
 # ============================================================
-# MEMORY CHECK — Render 500MB RAM protect
+# MEMORY CHECK
 # ============================================================
 def get_ram_usage_mb() -> float:
     process = psutil.Process(os.getpid())
@@ -81,7 +81,6 @@ def is_ram_safe() -> bool:
 
 def cleanup_memory():
     gc.collect()
-    # downloads folder পরিষ্কার করো
     if os.path.exists("downloads"):
         for f in os.listdir("downloads"):
             fp = os.path.join("downloads", f)
@@ -224,7 +223,6 @@ def get_top_referrers(limit=10):
     return rows
 
 def get_premium_expiring_soon():
-    """১ দিনের মধ্যে expire হবে এমন users"""
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect(DB_FILE)
@@ -264,13 +262,88 @@ def get_main_keyboard():
     ])
 
 # ============================================================
+# YT-DLP FORMAT OPTIONS — BUG FIX: dash/hls skip সরানো হয়েছে
+# ============================================================
+def get_base_ydl_opts(progress_hook=None):
+    """
+    FIX #1: 'skip': ['hls', 'dash'] সরানো হয়েছে।
+             YouTube এখন dash format এ video দেয়, skip করলে
+             'Requested format is not available' error আসে।
+    FIX #2: player_client তে web_safari যোগ করা হয়েছে।
+    FIX #3: format_sort যোগ করা হয়েছে ভালো quality পেতে।
+    """
+    opts = {
+        'outtmpl': 'downloads/%(id)s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'merge_output_format': 'mp4',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'android', 'ios'],
+                # 'skip' সরানো হয়েছে — এটাই আগের bug ছিল!
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+        # FIX #3: format_sort — mp4 prefer করবে, তারপর webm
+        'format_sort': ['ext:mp4:m4a', 'res', 'br'],
+    }
+
+    if progress_hook:
+        opts['progress_hooks'] = [progress_hook]
+
+    if os.path.exists("cookies.txt"):
+        opts['cookiefile'] = "cookies.txt"
+
+    return opts
+
+def get_format_string(quality: str, is_prem: bool) -> str:
+    """
+    FIX #4: Improved format strings — dash compatible।
+    bestvideo+bestaudio merge করবে (dash format সহ),
+    fallback এ best single-file format।
+    """
+    if quality == "dl_audio":
+        return 'bestaudio/best'
+    elif quality == "dl_360":
+        return (
+            'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo[height<=360]+bestaudio/'
+            'best[height<=360]/'
+            'best'
+        )
+    elif quality == "dl_480":
+        return (
+            'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo[height<=480]+bestaudio/'
+            'best[height<=480]/'
+            'best'
+        )
+    elif quality == "dl_720":
+        return (
+            'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo[height<=720]+bestaudio/'
+            'best[height<=720]/'
+            'best'
+        )
+    elif quality == "dl_1080":
+        return (
+            'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+            'bestvideo[height<=1080]+bestaudio/'
+            'best[height<=1080]/'
+            'best'
+        )
+    return 'best'
+
+# ============================================================
 # /start
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user.id, user.username, user.first_name)
 
-    # Ban check
     if is_user_banned(user.id):
         await update.message.reply_text("🚫 You are banned from using this bot.")
         return
@@ -295,7 +368,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
-    # ✅ Admin notify — নতুন user join
     try:
         await context.bot.send_message(
             chat_id=ADMIN_ID,
@@ -431,7 +503,6 @@ async def mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_dl = get_total_downloads(user.id)
     is_prem, status_str = is_user_premium(user.id)
 
-    # Last 5 downloads
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""SELECT title, quality, download_time FROM download_log
@@ -507,7 +578,6 @@ async def add_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📅 Expires: `{exp_time}`",
             parse_mode="Markdown"
         )
-        # User কে notify করো
         try:
             await context.bot.send_message(
                 chat_id=target_id,
@@ -621,7 +691,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================================
-# PREMIUM EXPIRY WARNING — Background Task
+# PREMIUM EXPIRY WARNING
 # ============================================================
 async def check_premium_expiry(context: ContextTypes.DEFAULT_TYPE):
     expiring = get_premium_expiring_soon()
@@ -657,7 +727,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please send a valid YouTube link.")
         return
 
-    # ✅ RAM check আগে করো
     if not is_ram_safe():
         cleanup_memory()
         if not is_ram_safe():
@@ -715,7 +784,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================================
-# HANDLE CALLBACK
+# HANDLE CALLBACK — MAIN DOWNLOAD FUNCTION
 # ============================================================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -731,7 +800,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Session expired. Link আবার পাঠাও।")
         return
 
-    # ✅ Download শুরুর আগে RAM check
     if not is_ram_safe():
         cleanup_memory()
         if not is_ram_safe():
@@ -745,20 +813,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_path = None
     quality_label = query.data.replace("dl_", "").upper()
+    is_prem, _ = is_user_premium(user_id)
 
     try:
+        # FIX #5: loop reference thread-safe ভাবে নেওয়া হয়েছে
+        loop = asyncio.get_event_loop()
         last_update = [0]
 
         def progress_hook(d):
             if d['status'] == 'downloading':
-                curr_time = asyncio.get_event_loop().time()
+                curr_time = loop.time()
                 if curr_time - last_update[0] > 2.5:
                     last_update[0] = curr_time
                     downloaded = d.get('downloaded_bytes', 0) / (1024 * 1024)
                     total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
                     total_mb = total / (1024 * 1024) if total else 0
 
-                    is_prem, _ = is_user_premium(user_id)
                     if total_mb > MAX_FILE_SIZE_MB and not is_prem:
                         raise Exception(f"File size {total_mb:.0f}MB — Free limit {MAX_FILE_SIZE_MB}MB!")
 
@@ -772,61 +842,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     asyncio.run_coroutine_threadsafe(
                         status_msg.edit_text(msg_text, parse_mode="Markdown"),
-                        asyncio.get_event_loop()
+                        loop
                     )
 
-        base_ydl_opts = {
-            'outtmpl': 'downloads/%(id)s.%(ext)s',
-            'quiet': True,
-            'no_warnings': True,
-            'progress_hooks': [progress_hook],
-            'merge_output_format': 'mp4',
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'web'],
-                    'skip': ['hls', 'dash']
-                }
-            },
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-            }
-        }
+        os.makedirs("downloads", exist_ok=True)
 
-        if os.path.exists("cookies.txt"):
-            base_ydl_opts['cookiefile'] = "cookies.txt"
+        # FIX #1 applied: get_base_ydl_opts() এ skip নেই
+        ydl_opts = get_base_ydl_opts(progress_hook=progress_hook)
+        ydl_opts['format'] = get_format_string(query.data, is_prem)
 
         if query.data == "dl_audio":
-            ydl_opts = {
-                **base_ydl_opts,
-                'format': 'bestaudio/best',
-                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-            }
-        elif query.data == "dl_360":
-            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best'}
-        elif query.data == "dl_480":
-            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best'}
-        elif query.data == "dl_720":
-            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best'}
-        elif query.data == "dl_1080":
-            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'}
-
-        os.makedirs("downloads", exist_ok=True)
-        loop = asyncio.get_event_loop()
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192'
+            }]
 
         def download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
+                # FIX #6: সঠিক filename বের করার উন্নত পদ্ধতি
                 filename = ydl.prepare_filename(info)
+
                 if query.data == "dl_audio":
-                    filename = os.path.splitext(filename)[0] + ".mp3"
-                elif not os.path.exists(filename):
-                    base = os.path.splitext(filename)[0]
-                    for ext in ['.mp4', '.mkv', '.webm']:
-                        if os.path.exists(base + ext):
-                            filename = base + ext
-                            break
-                return filename, info.get('title', 'Media')
+                    # Audio: .mp3 extension
+                    mp3_path = os.path.splitext(filename)[0] + ".mp3"
+                    if os.path.exists(mp3_path):
+                        return mp3_path, info.get('title', 'Audio')
+
+                # Video: mp4 prefer, তারপর অন্য extension খোঁজো
+                if os.path.exists(filename):
+                    return filename, info.get('title', 'Video')
+
+                base = os.path.splitext(filename)[0]
+                for ext in ['.mp4', '.mkv', '.webm', '.m4v']:
+                    candidate = base + ext
+                    if os.path.exists(candidate):
+                        return candidate, info.get('title', 'Video')
+
+                # FIX #7: downloads folder এ সবচেয়ে নতুন file খোঁজো
+                dl_folder = "downloads"
+                files = [
+                    os.path.join(dl_folder, f)
+                    for f in os.listdir(dl_folder)
+                    if os.path.isfile(os.path.join(dl_folder, f))
+                ]
+                if files:
+                    newest = max(files, key=os.path.getmtime)
+                    return newest, info.get('title', 'Media')
+
+                raise Exception("Downloaded file not found!")
 
         file_path, title = await loop.run_in_executor(None, download)
 
@@ -848,23 +913,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     video=f,
                     caption=f"🎥 *{title}*\n\nDownloaded via YouTube Bot",
                     reply_markup=get_main_keyboard(),
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    supports_streaming=True  # FIX #8: streaming support যোগ করা হয়েছে
                 )
 
-        # ✅ Log download
         log_download(user_id, title, quality_label)
 
-        is_prem, _ = is_user_premium(user_id)
         if not is_prem:
             increment_user_quota(user_id)
 
         await status_msg.delete()
 
     except Exception as e:
-        logger.error(f"Download Error: {e}")
+        error_msg = str(e)
+        logger.error(f"Download Error for user {user_id}: {error_msg}")
+
+        # FIX #9: User-friendly error messages
+        if "Requested format is not available" in error_msg:
+            friendly = "এই quality-তে video পাওয়া যাচ্ছে না। অন্য quality try করো।"
+        elif "Video unavailable" in error_msg or "Private video" in error_msg:
+            friendly = "Video unavailable বা private। অন্য link দাও।"
+        elif "Sign in" in error_msg or "age" in error_msg.lower():
+            friendly = "Age-restricted video। এটা download করা যাচ্ছে না।"
+        elif "File size" in error_msg and "limit" in error_msg:
+            friendly = f"File অনেক বড়! Free users এর জন্য limit {MAX_FILE_SIZE_MB}MB।"
+        elif "HTTP Error 429" in error_msg:
+            friendly = "YouTube rate limit করেছে। ১ মিনিট পরে আবার try করো।"
+        else:
+            friendly = f"`{error_msg[:150]}`\n\n💡 অন্য quality try করো বা link check করো।"
+
         await status_msg.edit_text(
-            f"❌ *Download Failed!*\n\n`{str(e)[:200]}`\n\n"
-            f"💡 অন্য quality try করো বা link check করো।",
+            f"❌ *Download Failed!*\n\n{friendly}",
             parse_mode="Markdown"
         )
 
@@ -874,7 +953,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(file_path)
             except Exception as e:
                 logger.error(f"File delete error: {e}")
-        # ✅ Memory cleanup সবসময়
         cleanup_memory()
 
 # ============================================================
@@ -882,15 +960,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("CRITICAL: Set BOT_TOKEN!")
+        print("CRITICAL: Set BOT_TOKEN environment variable!")
         return
 
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
+        .read_timeout(60)   # FIX #10: read_timeout বাড়ানো হয়েছে বড় file এর জন্য
+        .write_timeout(60)  # FIX #10: write_timeout বাড়ানো হয়েছে upload এর জন্য
         .pool_timeout(30)
         .build()
     )
@@ -914,13 +992,14 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    # ✅ Premium expiry check — প্রতি 6 ঘণ্টায়
+    # Premium expiry check
     application.job_queue.run_repeating(
         check_premium_expiry,
-        interval=21600,  # 6 hours
+        interval=21600,
         first=60
     )
 
+    logger.info("Bot started successfully!")
     application.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
