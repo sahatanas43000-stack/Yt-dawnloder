@@ -38,9 +38,7 @@ MAX_FILE_SIZE_MB = 100  # Server Protection Limit
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Users table
     c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, referral_bonus INTEGER DEFAULT 0)''')
-    # Daily quota table
     c.execute('''CREATE TABLE IF NOT EXISTS quota 
                  (user_id INTEGER, download_date TEXT, count INTEGER, PRIMARY KEY (user_id, download_date))''')
     conn.commit()
@@ -147,7 +145,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user.id)
 
-    # Referral Check
     if context.args:
         try:
             referrer_id = int(context.args[0])
@@ -209,7 +206,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# Admin Broadcast Command
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -232,12 +228,11 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     await msg.edit_text(f"📢 **Broadcast Finished!**\n\n✅ Sent: `{sent}`\n❌ Failed: `{failed}`", parse_mode="Markdown")
 
-# Admin Post Broadcast (Forward/Photo/Video) Command
 async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     if not update.message.reply_to_message:
-        await update.message.reply_text("❌ Reply to a message (photo, video, or text) with `/post` to broadcast it.")
+        await update.message.reply_text("❌ Reply to a message with `/post` to broadcast it.")
         return
 
     target_msg = update.message.reply_to_message
@@ -328,13 +323,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_path = None
     try:
-        # Progress Hook Function
         last_update = 0
         def progress_hook(d):
             nonlocal last_update
             if d['status'] == 'downloading':
                 curr_time = asyncio.get_event_loop().time()
-                if curr_time - last_update > 2:  # Edit every 2 seconds
+                if curr_time - last_update > 2:
                     last_update = curr_time
                     downloaded = d.get('downloaded_bytes', 0) / (1024 * 1024)
                     total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
@@ -355,12 +349,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'web', 'tv_embedded']
+                    'player_client': ['ios', 'android', 'mweb'],
+                    'skip': ['hls', 'dash']
                 }
             }
         }
 
-        # Add Cookies support if cookies.txt file exists
         if os.path.exists("cookies.txt"):
             base_ydl_opts['cookiefile'] = "cookies.txt"
 
@@ -413,7 +407,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
 
-        # Record Quota/Bonus Usage
         is_premium = user_id in premium_users or user_id == ADMIN_ID
         if not is_premium:
             today_dl, bonus = get_user_data(user_id)
