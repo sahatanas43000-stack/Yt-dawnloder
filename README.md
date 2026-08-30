@@ -1,26 +1,53 @@
-# 🚀 Telegram YouTube Downloader Bot (Render Ready)
+# 🚀 YouTube Video & Audio Downloader Telegram Bot
 
-A feature-packed, memory-optimized YouTube Downloader Telegram Bot built with Python, `python-telegram-bot`, `yt-dlp`, and Flask. Configured specifically for deployment on Render's free tier with 24/7 uptime monitoring.
+A feature-rich, high-performance Telegram Bot built using **Python**, **python-telegram-bot**, and **yt-dlp**. It allows users to download YouTube videos in multiple resolutions and audio formats with daily limits, a referral system, and anti-bot bypass configurations.
+
+---
 
 ## ✨ Features
-* **Quality Options:** 720p HD for Free Users & 1080p Full HD for Premium Users.
-* **Format Selector:** Download as MP3 Audio or Video options.
-* **Force Join Guard:** Restricts access until users join required Telegram channels.
-* **Zero Storage Leak:** Downloaded media is instantly wiped after delivery to keep Render's 512MB RAM/Disk safe.
-* **24/7 Keep-Alive:** Built-in Flask web server compatible with UptimeRobot pinging.
-* **Admin Controls:** Premium user management commands (`/add_premium`, `/remove_premium`, `/stats`).
 
-## 📁 File Structure
-* `app.py`: Flask web server entry point that keeps the app awake and spawns the bot thread.
-* `bot.py`: Main Telegram Bot logic, download handlers, and UI setup.
-* `requirements.txt`: Python package dependencies.
-* `Procfile`: Tells Render how to start the Web application (`web: python app.py`).
-* `nixpacks.toml`: Installs system dependencies like `ffmpeg` for media processing.
+* 🎥 **Multiple Quality Options:** Download in **360p**, **480p**, **720p HD**, and **1080p Full HD** (Premium).
+* 🎵 **Audio Extraction:** High-quality MP3 audio download.
+* ⚡ **Live Download Progress:** Real-time updates showing downloaded MBs and percentage (`%`).
+* 🔒 **Force Channel Join:** Ensures users subscribe to specified Telegram channels before downloading.
+* 👥 **Referral System:** Free users can invite friends via unique referral links to earn extra download quotas.
+* 📊 **Daily Quota System:** SQLite-backed 2-downloads/24h limit for free users.
+* ⭐ **Premium Membership:** Custom admin command to grant unlimited downloads and 1080p access.
+* 🛡️ **Anti-Bot Bypass & Cookies:** Configured player clients and optional `cookies.txt` support to bypass YouTube IP blocks.
+* 📢 **Admin Broadcasting:** Broadcast text messages or forward media posts to all bot users.
+* 📦 **Server Protection:** Automatic file limit (100 MB) to protect free tier servers (e.g., Render) from RAM crashes.
 
-## ⚙️ Environment Variables Required
-Set these in your Render Environment configuration:
-* `BOT_TOKEN` — Telegram Bot Token from @BotFather.
-* `ADMIN_ID` — Your Telegram numeric User ID.
+---
 
-## 👨‍💻 Maintainer
-* **Developer:** [@Devsahatanas](https://t.me/Devsahatanas)
+## 🛠️ Environment Variables
+
+Set the following Environment Variables in your hosting environment (e.g., Render, Railway, Heroku):
+
+| Variable | Description |
+| :--- | :--- |
+| `BOT_TOKEN` | Your Telegram Bot Token from `@BotFather` |
+| `ADMIN_ID` | Your Telegram Numeric User ID |
+| `PORT` | (Optional) Web server port for Flask pinging (Default: `10000`) |
+
+---
+
+## 🎮 Admin Commands
+
+| Command | Usage | Description |
+| :--- | :--- | :--- |
+| `/add_premium` | `/add_premium <user_id>` | Add a user to the Premium list |
+| `/remove_premium` | `/remove_premium <user_id>` | Remove a user from the Premium list |
+| `/stats` | `/stats` | View total users and premium members count |
+| `/broadcast` | `/broadcast <text>` | Send a text message to all users |
+| `/post` | Reply to media with `/post` | Forward/Broadcast media posts to all users |
+
+---
+
+## 🚀 Deployment Guide (Render)
+
+1. **Fork/Push** this repository to your GitHub account.
+2. Create a new **Web Service** on [Render](https://render.com).
+3. Connect your GitHub repository.
+4. Set the **Build Command**:
+   ```bash
+   pip install -r requirements.txt
