@@ -346,14 +346,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg = f"⏬ **Downloading...**\n\n📊 *Progress:* `{percent}`\n📁 *Downloaded:* `{downloaded:.1f}MB / {total_mb:.1f}MB`"
                     asyncio.run_coroutine_threadsafe(status_msg.edit_text(msg, parse_mode="Markdown"), asyncio.get_event_loop())
 
-        base_ydl_opts = {
+             base_ydl_opts = {
             'outtmpl': 'downloads/%(id)s.%(ext)s',
             'quiet': True,
             'no_warnings': True,
             'progress_hooks': [progress_hook],
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web'],
+                    'skip': ['hls', 'dash']
+                }
+            },
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
         }
-
         if os.path.exists("cookies.txt"):
             base_ydl_opts['cookiefile'] = "cookies.txt"
 
