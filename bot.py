@@ -83,11 +83,9 @@ def is_user_premium(user_id: int) -> tuple[bool, str]:
 
     ref_count, prem_until = row[0], row[1]
 
-    # Rule 1: 100 Referrals = Lifetime Unlimited
     if ref_count >= REFERRAL_THRESHOLD_FOR_UNLIMITED:
         return True, "Unlimited (100+ Referrals)"
 
-    # Rule 2: Days-based Premium
     if prem_until:
         try:
             exp_date = datetime.strptime(prem_until, "%Y-%m-%d %H:%M:%S")
@@ -353,28 +351,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'quiet': True,
             'no_warnings': True,
             'progress_hooks': [progress_hook],
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'mweb'], 'skip': ['hls', 'dash']}}
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         }
 
         if os.path.exists("cookies.txt"):
             base_ydl_opts['cookiefile'] = "cookies.txt"
 
-        # 🛠️ SMART FORMAT FALLBACKS (Fixes 'Requested format is not available' error)
+        # 🛠️ ULTIMATE UNIVERSAL FORMAT FALLBACK (Fixes All Format Errors)
         if query.data == "dl_audio":
             ydl_opts = {
                 **base_ydl_opts,
-                'format': 'ba/bestaudio/b',
+                'format': 'bestaudio/best',
                 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
             }
         elif query.data == "dl_360":
-            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=360]/bv*[height<=360]+ba/best[height<=360]/b'}
+            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=360]+bestaudio/best[height<=360]/best'}
         elif query.data == "dl_480":
-            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=480]/bv*[height<=480]+ba/best[height<=480]/b'}
+            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'}
         elif query.data == "dl_720":
-            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=720]/bv*[height<=720]+ba/best[height<=720]/b'}
+            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'}
         elif query.data == "dl_1080":
-            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=1080]/bv*[height<=1080]+ba/best/b'}
+            ydl_opts = {**base_ydl_opts, 'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'}
 
         os.makedirs("downloads", exist_ok=True)
 
@@ -421,7 +418,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ **Failed to process video.**\n\nError: `{str(e)[:150]}`", parse_mode="Markdown")
 
     finally:
-        # RAM Cleanup & Temporary File Removal
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
