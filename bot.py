@@ -360,20 +360,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists("cookies.txt"):
             base_ydl_opts['cookiefile'] = "cookies.txt"
 
+        # 🛠️ SMART FORMAT FALLBACKS (Fixes 'Requested format is not available' error)
         if query.data == "dl_audio":
             ydl_opts = {
                 **base_ydl_opts,
-                'format': 'bestaudio/best',
+                'format': 'ba/bestaudio/b',
                 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
             }
         elif query.data == "dl_360":
-            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=360]/bv*[height<=360]+ba/b'}
+            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=360]/bv*[height<=360]+ba/best[height<=360]/b'}
         elif query.data == "dl_480":
-            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=480]/bv*[height<=480]+ba/b'}
+            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=480]/bv*[height<=480]+ba/best[height<=480]/b'}
         elif query.data == "dl_720":
-            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=720]/bv*[height<=720]+ba/b'}
+            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=720]/bv*[height<=720]+ba/best[height<=720]/b'}
         elif query.data == "dl_1080":
-            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=1080]/bv*[height<=1080]+ba/b'}
+            ydl_opts = {**base_ydl_opts, 'format': 'b[height<=1080]/bv*[height<=1080]+ba/best/b'}
 
         os.makedirs("downloads", exist_ok=True)
 
@@ -420,7 +421,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ **Failed to process video.**\n\nError: `{str(e)[:150]}`", parse_mode="Markdown")
 
     finally:
-        # RAM Cleanup & File removal
+        # RAM Cleanup & Temporary File Removal
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
