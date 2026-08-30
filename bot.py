@@ -1,639 +1,278 @@
-"""
-Telegram YouTube Downloader Bot
-================================
-Dev: Anas
-
-Production-grade YouTube downloader bot built for deployment on Railway.app's
-free tier (512MB RAM). Uses python-telegram-bot v20+ (async) and yt-dlp.
-
-Key design choices for Railway free tier survival:
-    - Single-download concurrency (asyncio.Semaphore) to avoid RAM spikes.
-    - Hard-capped resolution (720p) and file size to avoid disk/RAM blowups.
-    - Downloaded files are ALWAYS removed in a `finally` block, even on error.
-    - Explicit `gc.collect()` after every upload cycle.
-    - SQLite (file-based, zero extra services) for quota + admin tracking.
-    - Browser-like headers + extractor args to bypass Railway IP blocks.
-"""
-
 import os
-import re
-import gc
-import time
+import json
 import logging
-import sqlite3
 import asyncio
-from datetime import datetime, timedelta, timezone
-
-import yt_dlp
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
-    filters,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters
 )
+import yt_dlp
 
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_CODE = os.environ.get("ADMIN_CODE", "1169")
-BOT_DEV = "Anas"
-SUPPORT_URL = os.environ.get("SUPPORT_URL", "https://t.me/DevAnas")
-
-DB_PATH = os.environ.get("DB_PATH", "/tmp/bot_data.db")
-DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/downloads")
-
-MAX_DAILY_DOWNLOADS = 2                 # standard users
-MAX_FILE_SIZE_MB = 50                   # Telegram Bot API hard cap for uploads
-MAX_DURATION_SECONDS = 30 * 60          # 30 minutes safety cap
-MAX_RESOLUTION_FORMAT = (
-    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
-    "/bestvideo[height<=720]+bestaudio"
-    "/best[height<=720]"
-    "/best"
-)
-MAX_CONCURRENT_DOWNLOADS = 1            # keep RAM usage predictable on free tier
-
-YOUTUBE_URL_REGEX = re.compile(
-    r"(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be)/\S+", re.IGNORECASE
-)
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
+# Set up logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-logger = logging.getLogger("yt_downloader_bot")
-
-download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-
-# in-memory map of currently displayed status text, used by the
-# "Live Status" inline button so it can answer with a fresh popup.
-# key: (chat_id, message_id) -> str
-active_status_text = {}
-
-# --------------------------------------------------------------------------- #
-# yt-dlp shared options (browser spoofing to bypass Railway IP blocks)
-# --------------------------------------------------------------------------- #
-
-YTDLP_BASE_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "socket_timeout": 30,
-    # Impersonate a real browser so YouTube doesn't block datacenter IPs
-    "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-    # Use Android client — much less restricted than web client on server IPs
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android", "web"],
-            "skip": ["hls", "dash"],
-        }
-    },
-    "retries": 5,
-    "fragment_retries": 5,
-    "ignoreerrors": False,
-}
-
-
-# --------------------------------------------------------------------------- #
-# Database layer
-# --------------------------------------------------------------------------- #
-
-def db_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            is_admin INTEGER NOT NULL DEFAULT 0,
-            joined_at TEXT NOT NULL
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS downloads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            url TEXT,
-            downloaded_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def ensure_user(user_id: int, username: str):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    if cur.fetchone() is None:
-        cur.execute(
-            "INSERT INTO users (user_id, username, is_admin, joined_at) VALUES (?, ?, 0, ?)",
-            (user_id, username, datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
-    conn.close()
-
-
-def is_user_admin(user_id: int) -> bool:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row and row["is_admin"] == 1)
-
-
-def grant_admin(user_id: int):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_downloads_last_24h(user_id: int) -> int:
-    conn = db_connect()
-    cur = conn.cursor()
-    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    cur.execute(
-        "SELECT COUNT(*) AS c FROM downloads WHERE user_id = ? AND downloaded_at >= ?",
-        (user_id, since),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row["c"] if row else 0
-
-
-def record_download(user_id: int, url: str):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO downloads (user_id, url, downloaded_at) VALUES (?, ?, ?)",
-        (user_id, url, datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def can_user_download(user_id: int) -> bool:
-    if is_user_admin(user_id):
-        return True
-    return get_downloads_last_24h(user_id) < MAX_DAILY_DOWNLOADS
-
-
-# --------------------------------------------------------------------------- #
-# UI helpers
-# --------------------------------------------------------------------------- #
-
-def status_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🔄 Live Status", callback_data="live_status"),
-                InlineKeyboardButton("💬 Support", url=SUPPORT_URL),
-            ]
-        ]
-    )
-
-
-def limit_reached_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🔑 How to Get Unlimited Access", callback_data="how_to_redeem")],
-            [InlineKeyboardButton("💬 Contact Support", url=SUPPORT_URL)],
-        ]
-    )
-
-
-async def set_status(message, chat_id: int, text: str, keyboard=None):
-    """Edit the status message and remember the text for the Live Status button."""
-    try:
-        await message.edit_text(
-            text, reply_markup=keyboard or status_keyboard(), parse_mode=ParseMode.HTML
-        )
-        active_status_text[(chat_id, message.message_id)] = text
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to edit status message: %s", exc)
-
-
-# --------------------------------------------------------------------------- #
-# yt-dlp helpers (run in a background thread so we never block the event loop)
-# --------------------------------------------------------------------------- #
-
-def _extract_info_sync(url: str) -> dict:
-    opts = {
-        **YTDLP_BASE_OPTS,
-        "skip_download": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def _download_sync(url: str, output_template: str) -> str:
-    opts = {
-        **YTDLP_BASE_OPTS,
-        "format": MAX_RESOLUTION_FORMAT,
-        "merge_output_format": "mp4",
-        "outtmpl": output_template,
-        "restrictfilenames": True,
-        "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
-        "concurrent_fragment_downloads": 1,
-        # Postprocessor: ensure mp4 output via ffmpeg
-        "postprocessors": [
-            {
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": "mp4",
-            }
-        ],
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        # yt-dlp may change extension after merge — get the real filename
-        filename = ydl.prepare_filename(info)
-        # If the merged file is .mp4 already, return it
-        if os.path.exists(filename):
-            return filename
-        # Fallback: look for any file matching the safe_name prefix
-        base = os.path.splitext(filename)[0]
-        for ext in ("mp4", "mkv", "webm", "avi"):
-            candidate = f"{base}.{ext}"
-            if os.path.exists(candidate):
-                return candidate
-        return filename
-
-
-async def extract_info(url: str) -> dict:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _extract_info_sync, url)
-
-
-async def download_video(url: str, output_template: str) -> str:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _download_sync, url, output_template)
-
-
-# --------------------------------------------------------------------------- #
-# Command handlers
-# --------------------------------------------------------------------------- #
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user.id, user.username or user.first_name)
-
-    text = (
-        "👋 <b>Welcome to YT Downloader Bot!</b>\n\n"
-        "Send me any YouTube link and I'll fetch the video for you "
-        "(capped at <b>720p</b> to keep things fast and stable).\n\n"
-        "📊 <b>Rules:</b>\n"
-        f"• Free users: <b>{MAX_DAILY_DOWNLOADS} downloads / 24 hours</b>\n"
-        f"• Max video length: <b>{MAX_DURATION_SECONDS // 60} minutes</b>\n"
-        f"• Max file size: <b>{MAX_FILE_SIZE_MB}MB</b>\n"
-        "• Live streams / private videos are not supported\n\n"
-        "🔑 Have an access code? Use:\n"
-        "<code>/redeem &lt;code&gt;</code>\n\n"
-        "Just paste a YouTube link below to get started! 🎬\n\n"
-        f"🛠 <i>Bot developed by {BOT_DEV}</i>"
-    )
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("💬 Support", url=SUPPORT_URL)]]
-        ),
-    )
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user.id, user.username or user.first_name)
-
-    if is_user_admin(user.id):
-        text = "👑 <b>You have unlimited (Admin/VIP) access.</b>"
-    else:
-        used = get_downloads_last_24h(user.id)
-        remaining = max(0, MAX_DAILY_DOWNLOADS - used)
-        text = (
-            f"📊 <b>Your Quota</b>\n"
-            f"Used today: <b>{used}/{MAX_DAILY_DOWNLOADS}</b>\n"
-            f"Remaining: <b>{remaining}</b>\n\n"
-            "Want unlimited downloads? Use <code>/redeem &lt;code&gt;</code>"
-        )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user.id, user.username or user.first_name)
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: <code>/redeem &lt;code&gt;</code>", parse_mode=ParseMode.HTML
-        )
-        return
-
-    submitted_code = context.args[0].strip()
-
-    if submitted_code == ADMIN_CODE:
-        if is_user_admin(user.id):
-            await update.message.reply_text("✅ You already have unlimited access!")
-            return
-        grant_admin(user.id)
-        await update.message.reply_text(
-            "🎉 <b>Access Granted!</b>\n"
-            "You now have <b>unlimited</b> downloads. Enjoy! 👑",
-            parse_mode=ParseMode.HTML,
-        )
-        logger.info("User %s redeemed admin access.", user.id)
-    else:
-        await update.message.reply_text("❌ Invalid code. Please check and try again.")
-
-
-# --------------------------------------------------------------------------- #
-# Callback query (inline button) handler
-# --------------------------------------------------------------------------- #
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    chat_id = query.message.chat_id
-    message_id = query.message.message_id
-
-    if query.data == "live_status":
-        current = active_status_text.get(
-            (chat_id, message_id), "⏳ No active task right now."
-        )
-        # strip simple HTML tags for the alert popup (alerts render plain text only)
-        plain = re.sub(r"<[^>]+>", "", current)
-        await query.answer(text=plain, show_alert=True)
-
-    elif query.data == "how_to_redeem":
-        await query.answer(
-            text="Use the command: /redeem <code>  — ask an admin for your access code.",
-            show_alert=True,
-        )
-    else:
-        await query.answer()
-
-
-# --------------------------------------------------------------------------- #
-# Core: handle a YouTube link sent as plain text
-# --------------------------------------------------------------------------- #
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    user = update.effective_user
-    text = (message.text or "").strip()
-
-    if not YOUTUBE_URL_REGEX.search(text):
-        await message.reply_text(
-            "🤔 That doesn't look like a YouTube link.\n"
-            "Send a valid link (youtube.com or youtu.be), or use /start for help."
-        )
-        return
-
-    ensure_user(user.id, user.username or user.first_name)
-
-    # --- Quota check --------------------------------------------------- #
-    if not can_user_download(user.id):
-        await message.reply_text(
-            "🚫 <b>Daily Limit Reached</b>\n\n"
-            f"You've used your <b>{MAX_DAILY_DOWNLOADS} free downloads</b> for today.\n"
-            "⏰ Your quota resets 24 hours after each download.\n\n"
-            "Want unlimited access? Enter your access code with "
-            "<code>/redeem &lt;code&gt;</code> 🔑",
-            parse_mode=ParseMode.HTML,
-            reply_markup=limit_reached_keyboard(),
-        )
-        return
-
-    url_match = YOUTUBE_URL_REGEX.search(text)
-    url = url_match.group(0)
-
-    status_msg = await message.reply_text(
-        "⏳ <b>Processing...</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=status_keyboard(),
-    )
-    active_status_text[(status_msg.chat_id, status_msg.message_id)] = "⏳ Processing..."
-
-    output_path = None
-    try:
-        async with download_semaphore:
-            # ---- Validate video before downloading ---- #
-            try:
-                info = await asyncio.wait_for(extract_info(url), timeout=45)
-            except asyncio.TimeoutError:
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "⏱️ <b>Timed out</b> while fetching video info. Please try again.",
-                )
-                return
-            except yt_dlp.utils.DownloadError as exc:
-                logger.info("Info extraction failed: %s", exc)
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "❌ <b>Couldn't access this video.</b>\n"
-                    "It may be private, age-restricted, or unavailable.",
-                )
-                return
-
-            if info.get("is_live"):
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "🔴 <b>Live streams are not supported.</b>",
-                )
-                return
-
-            duration = info.get("duration") or 0
-            if duration and duration > MAX_DURATION_SECONDS:
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "📏 <b>Video too long.</b>\n"
-                    f"Max allowed duration is {MAX_DURATION_SECONDS // 60} minutes.",
-                )
-                return
-
-            approx_size = info.get("filesize") or info.get("filesize_approx")
-            if approx_size and approx_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "📦 <b>File too large.</b>\n"
-                    f"This video exceeds the {MAX_FILE_SIZE_MB}MB upload limit at 720p.",
-                )
-                return
-
-            # ---- Download stage ---- #
-            await set_status(
-                status_msg, status_msg.chat_id, "📥 <b>Downloading (720p)...</b>"
-            )
-
-            safe_name = f"{user.id}_{int(time.time())}"
-            output_template = os.path.join(DOWNLOAD_DIR, f"{safe_name}.%(ext)s")
-
-            try:
-                output_path = await asyncio.wait_for(
-                    download_video(url, output_template), timeout=600
-                )
-            except asyncio.TimeoutError:
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "⏱️ <b>Download timed out.</b> Please try again later.",
-                )
-                return
-            except yt_dlp.utils.DownloadError as exc:
-                logger.info("Download failed: %s", exc)
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "❌ <b>Download failed.</b>\n"
-                    "The video might be restricted or temporarily unavailable.",
-                )
-                return
-
-            if not output_path or not os.path.exists(output_path):
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "❌ <b>Something went wrong.</b> File was not created.",
-                )
-                return
-
-            # Hard safety check on actual file size post-download.
-            actual_size = os.path.getsize(output_path)
-            if actual_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-                await set_status(
-                    status_msg,
-                    status_msg.chat_id,
-                    "📦 <b>File too large to send.</b>\n"
-                    f"Exceeds the {MAX_FILE_SIZE_MB}MB limit.",
-                )
-                return
-
-            # ---- Upload stage ---- #
-            await set_status(status_msg, status_msg.chat_id, "📤 <b>Uploading...</b>")
-
-            title = info.get("title", "video")
-            with open(output_path, "rb") as video_file:
-                await context.bot.send_video(
-                    chat_id=message.chat_id,
-                    video=video_file,
-                    caption=f"🎬 <b>{title}</b>\n\n🛠 via YT Downloader Bot by {BOT_DEV}",
-                    parse_mode=ParseMode.HTML,
-                    supports_streaming=True,
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=60,
-                )
-
-            record_download(user.id, url)
-
-            remaining = (
-                "Unlimited (Admin)"
-                if is_user_admin(user.id)
-                else str(max(0, MAX_DAILY_DOWNLOADS - get_downloads_last_24h(user.id)))
-            )
-            await set_status(
-                status_msg,
-                status_msg.chat_id,
-                f"✅ <b>Done!</b> Remaining downloads today: <b>{remaining}</b>",
-            )
-
-    except Exception as exc:  # noqa: BLE001 - final safety net
-        logger.exception("Unexpected error handling %s: %s", url, exc)
+logger = logging.getLogger(__name__)
+
+# CONFIGURATION (Set via Render Environment Variables or replace below)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))  # Replace with your Telegram User ID
+
+# Telegram Channels for Force Join
+CHANNEL_1 = "@sahatanas"
+CHANNEL_2 = "@sahatanass"
+CHANNEL_1_URL = "https://t.me/sahatanas"
+CHANNEL_2_URL = "https://t.me/sahatanass"
+OTHER_BOT_URL = "https://t.me/BomssssssssBot"
+
+PREMIUM_FILE = "premium_users.json"
+
+# Persistence for Premium Users
+def load_premium_users():
+    if os.path.exists(PREMIUM_FILE):
         try:
-            await set_status(
-                status_msg,
-                status_msg.chat_id,
-                "⚠️ <b>Unexpected error occurred.</b> Please try again later.",
-            )
-        except Exception:  # noqa: BLE001
-            pass
+            with open(PREMIUM_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception as e:
+            logger.error(f"Error loading premium file: {e}")
+            return set()
+    return set()
+
+def save_premium_users(users):
+    try:
+        with open(PREMIUM_FILE, "w") as f:
+            json.dump(list(users), f)
+    except Exception as e:
+        logger.error(f"Error saving premium file: {e}")
+
+premium_users = load_premium_users()
+
+# Check Force Join Status
+async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    for channel in [CHANNEL_1, CHANNEL_2]:
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status in ['left', 'kicked']:
+                return False
+        except Exception as e:
+            logger.warning(f"Could not check membership for {channel}: {e}")
+            # If bot is not admin in channel, skip check to prevent soft-lock
+            continue
+    return True
+
+def get_force_join_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📢 Join Channel 1", url=CHANNEL_1_URL)],
+        [InlineKeyboardButton("📢 Join Channel 2", url=CHANNEL_2_URL)],
+        [InlineKeyboardButton("🚀 Try Other Bot (@BomssssssssBot)", url=OTHER_BOT_URL)]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_main_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🛠️ Contact Admin", url="https://t.me/Devsahatanas")],
+        [InlineKeyboardButton("⚡ Any Video Downloader Bot", url=OTHER_BOT_URL)]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# Commands
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = (
+        f"👋 **Hi {user.first_name}!**\n\n"
+        f"Welcome to **YouTube Downloader Bot** 🚀\n\n"
+        f"📹 **Free Users:** Up to 720p HD Video & MP3 Audio\n"
+        f"⭐ **Premium Users:** 1080p Full HD Video\n\n"
+        f"📩 Just send me any YouTube Video link to start downloading!"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
+async def add_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        target_id = int(context.args[0])
+        premium_users.add(target_id)
+        save_premium_users(premium_users)
+        await update.message.reply_text(f"✅ User `{target_id}` added to Premium!", parse_mode="Markdown")
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Usage: `/add_premium <user_id>`", parse_mode="Markdown")
+
+async def remove_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        target_id = int(context.args[0])
+        premium_users.discard(target_id)
+        save_premium_users(premium_users)
+        await update.message.reply_text(f"🗑️ User `{target_id}` removed from Premium!", parse_mode="Markdown")
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Usage: `/remove_premium <user_id>`", parse_mode="Markdown")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(f"📊 **Bot Stats:**\n\n⭐ Total Premium Members: `{len(premium_users)}`", parse_mode="Markdown")
+
+# Handle Input YouTube Links
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if not ("youtube.com" in text or "youtu.be" in text):
+        await update.message.reply_text("⚠️ Please send a valid YouTube link.")
+        return
+
+    # Check Force Join
+    joined = await check_force_join(user_id, context)
+    if not joined:
+        await update.message.reply_text(
+            "⚠️ **Access Denied!**\n\nYou must join both our channels to download videos.",
+            parse_mode="Markdown",
+            reply_markup=get_force_join_keyboard()
+        )
+        return
+
+    # Store link in user_data
+    context.user_data['yt_url'] = text
+
+    is_premium = user_id in premium_users or user_id == ADMIN_ID
+    
+    keyboard = [
+        [InlineKeyboardButton("🎵 Audio Only (MP3)", callback_data="dl_audio")],
+        [InlineKeyboardButton("🎥 Video (720p HD)", callback_data="dl_720")]
+    ]
+
+    if is_premium:
+        keyboard.append([InlineKeyboardButton("⭐ Video (1080p Full HD)", callback_data="dl_1080")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔒 Video (1080p) [Premium Only]", callback_data="dl_locked")])
+
+    keyboard.append([InlineKeyboardButton("🤖 Check Other Bot", url=OTHER_BOT_URL)])
+
+    await update.message.reply_text(
+        "🎬 **Select Download Quality:**",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+# Callback Query Handler (Download Logic & Render Zero-Storage Cleanup)
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "dl_locked":
+        await query.message.reply_text("🔒 **1080p is reserved for Premium Members!**\nContact @Devsahatanas to upgrade.", parse_mode="Markdown")
+        return
+
+    url = context.user_data.get('yt_url')
+    if not url:
+        await query.edit_message_text("❌ Session expired. Please send the link again.")
+        return
+
+    status_msg = await query.message.reply_text("⏳ **Processing & Downloading... Please wait.**", parse_mode="Markdown")
+
+    file_path = None
+    try:
+        # Dynamic Options based on Selection
+        if query.data == "dl_audio":
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': 'downloads/%(id)s.%(ext)s',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'quiet': True,
+                'no_warnings': True,
+            }
+        elif query.data == "dl_720":
+            ydl_opts = {
+                'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best',
+                'outtmpl': 'downloads/%(id)s.%(ext)s',
+                'quiet': True,
+                'no_warnings': True,
+            }
+        elif query.data == "dl_1080":
+            ydl_opts = {
+                'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best',
+                'outtmpl': 'downloads/%(id)s.%(ext)s',
+                'quiet': True,
+                'no_warnings': True,
+            }
+
+        os.makedirs("downloads", exist_ok=True)
+
+        loop = asyncio.get_event_loop()
+        def download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                if query.data == "dl_audio":
+                    filename = os.path.splitext(filename)[0] + ".mp3"
+                return filename, info.get('title', 'Media')
+
+        file_path, title = await loop.run_in_executor(None, download)
+
+        await status_msg.edit_text("📤 **Uploading file to Telegram...**", parse_mode="Markdown")
+
+        # Send File to User
+        with open(file_path, 'rb') as f:
+            if query.data == "dl_audio":
+                await context.bot.send_audio(
+                    chat_id=query.message.chat_id,
+                    audio=f,
+                    title=title,
+                    caption=f"🎵 **{title}**\n\nDownloaded via YouTube Bot",
+                    reply_markup=get_main_keyboard(),
+                    parse_mode="Markdown"
+                )
+            else:
+                await context.bot.send_video(
+                    chat_id=query.message.chat_id,
+                    video=f,
+                    caption=f"🎥 **{title}**\n\nDownloaded via YouTube Bot",
+                    reply_markup=get_main_keyboard(),
+                    parse_mode="Markdown"
+                )
+
+        await status_msg.delete()
+
+    except Exception as e:
+        logger.error(f"Download Error: {e}")
+        await status_msg.edit_text(f"❌ **Failed to process video.**\n\nError: `{str(e)[:100]}`", parse_mode="Markdown")
 
     finally:
-        # ---- Cleanup stage: ALWAYS runs, even on failure ---- #
-        try:
-            if output_path and os.path.exists(output_path):
-                os.remove(output_path)
-                logger.info("Removed temp file: %s", output_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to remove temp file %s: %s", output_path, exc)
-
-        active_status_text.pop((status_msg.chat_id, status_msg.message_id), None)
-        gc.collect()
-
-
-# --------------------------------------------------------------------------- #
-# Global error handler
-# --------------------------------------------------------------------------- #
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Update %s caused error: %s", update, context.error)
-
-
-# --------------------------------------------------------------------------- #
-# Entrypoint
-# --------------------------------------------------------------------------- #
+        # CRITICAL FOR RENDER: Instant Cleanup to prevent 500MB storage crash
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(f"Cleaned up file: {file_path}")
+            except Exception as e:
+                logger.error(f"Failed to delete file: {e}")
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable is not set. "
-            "Set it in Railway's Variables tab before deploying."
-        )
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("CRITICAL: Set BOT_TOKEN environment variable!")
+        return
 
-    init_db()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add_premium", add_premium))
+    application.add_handler(CommandHandler("remove_premium", remove_premium))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(handle_callback))
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", start_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("redeem", redeem_command))
-    application.add_handler(CommandHandler("admin", redeem_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-    application.add_error_handler(error_handler)
-
-    logger.info("Bot starting (dev: %s)...", BOT_DEV)
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
