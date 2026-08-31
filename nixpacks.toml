@@ -1,5 +1,8 @@
-[providers]
-providers = ["python"]
+[phases.setup]
+nixPkgs = ["python3", "ffmpeg"]
 
-[apt]
-packages = ["ffmpeg"]
+[phases.build]
+cmds = ["python -m venv .venv", ".venv/bin/pip install -r requirements.txt"]
+
+[start]
+cmd = "python app.py"
