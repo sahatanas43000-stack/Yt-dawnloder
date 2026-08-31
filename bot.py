@@ -42,11 +42,11 @@ CHANNEL_2_URL = "https://t.me/sahatanass"
 OTHER_BOT_URL = "https://t.me/BomssssssssBot"
 
 DB_FILE                       = "user_data.db"
-MAX_FILE_SIZE_MB               = 80
+MAX_FILE_SIZE_MB               = 45  # Render free tier-এ মেমোরি ক্র্যাশ ঠেকাতে 45MB লিমিট
 RAM_LIMIT_MB                   = 400
 REFERRAL_THRESHOLD_FOR_UNLIMITED = 100
-TELEGRAM_UPLOAD_LIMIT_MB       = 49
-DOWNLOAD_LOCK                  = asyncio.Semaphore(2)   # max 2 concurrent
+TELEGRAM_UPLOAD_LIMIT_MB       = 45
+DOWNLOAD_LOCK                  = asyncio.Semaphore(1)   # Render 512MB RAM এর জন্য ১টি concurrent download
 
 # ── Markdown escape ────────────────────────────────────────
 _MD_SPECIAL = re.compile(r'([_*\[\]()~`>#+\-=|{}.!\\])')
@@ -68,7 +68,7 @@ def is_youtube_url(text: str) -> bool:
 # DATABASE
 # ============================================================
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_FILE, timeout=10)
+    c = sqlite3.connect(DB_FILE, timeout=20)
     c.execute("PRAGMA journal_mode=WAL")
     return c
 
@@ -119,7 +119,6 @@ def register_user(user_id: int, username: str = None, first_name: str = None):
         )
 
 def add_referral(referrer_id: int, referee_id: int) -> bool:
-    """Returns True only if this is a NEW referral (not duplicate)."""
     with _conn() as db:
         try:
             db.execute(
@@ -132,7 +131,7 @@ def add_referral(referrer_id: int, referee_id: int) -> bool:
             )
             return True
         except sqlite3.IntegrityError:
-            return False  # duplicate — ignore
+            return False
 
 def is_user_banned(user_id: int) -> bool:
     with _conn() as db:
@@ -252,11 +251,11 @@ def is_ram_safe() -> bool:
     return get_ram_usage_mb() < RAM_LIMIT_MB
 
 def cleanup_old_files():
-    """Delete files older than 1 hour — safe to call anytime."""
+    """Delete files in download directory — safe to call anytime."""
     dl_folder = "downloads"
     if not os.path.exists(dl_folder):
         return
-    cutoff = datetime.now().timestamp() - 3600
+    cutoff = datetime.now().timestamp() - 1800  # 30 minute cutoff
     for root, _, files in os.walk(dl_folder):
         for fname in files:
             fpath = os.path.join(root, fname)
@@ -278,6 +277,7 @@ async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
                 return False
         except Exception as e:
             logger.warning("Force-join check skipped (%s): %s", ch, e)
+            return True  # বট মেম্বারশিপ চ্যানেল চেক করতে না পারলে আটকে রাখবে না
     return True
 
 def force_join_kb():
@@ -316,10 +316,10 @@ def get_base_ydl_opts(
         "overwrites":        False,
         "merge_output_format": "mp4",
         "format_sort":       ["res", "fps", "vcodec:h264", "acodec:aac", "br"],
+        "max_filesize":      f"{MAX_FILE_SIZE_MB}M",  # Render free tier-এ স্টোরেজ সেভ করতে ৪৫MB সীমানা
         "extractor_args": {
             "youtube": {
                 "player_client": ["web", "android", "ios"],
-                # NO 'skip' key — that was the original root bug
             }
         },
         "http_headers": {
@@ -328,8 +328,6 @@ def get_base_ydl_opts(
             "Accept-Language": "en-US,en;q=0.9",
         },
     }
-    if not is_premium_user:
-        opts["max_filesize"] = f"{MAX_FILE_SIZE_MB}M"
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     if os.path.exists("cookies.txt"):
@@ -344,8 +342,8 @@ def get_format_string(quality: str) -> str:
         return "bestaudio/best"
     h = {"dl_360": 360, "dl_480": 480, "dl_720": 720, "dl_1080": 1080}.get(quality, 360)
     return (
-        f"bestvideo[height<={h}]+bestaudio/"
-        f"best[height<={h}]/"
+        f"bestvideo[height<={h}][filesize<={MAX_FILE_SIZE_MB}M]+bestaudio/"
+        f"best[height<={h}][filesize<={MAX_FILE_SIZE_MB}M]/"
         "best"
     )
 
@@ -362,7 +360,6 @@ def find_downloaded_file(ydl, info: dict, download_dir: str, is_audio: bool):
         c = base + ext
         if os.path.exists(c):
             return c
-    # last resort: newest file in folder
     files = [
         os.path.join(download_dir, f)
         for f in os.listdir(download_dir)
@@ -383,7 +380,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 You are banned from using this bot.")
         return
 
-    # FIX: duplicate referral guard via referral_log table
     if context.args:
         try:
             referrer_id = int(context.args[0])
@@ -681,7 +677,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    # FIX: better URL validation
     if not is_youtube_url(text):
         await update.message.reply_text("⚠️ Please send a valid YouTube link.")
         return
@@ -753,163 +748,149 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ *Server busy!* একটু পরে try করো।", parse_mode="Markdown")
         return
 
-    status_msg = await query.message.reply_text("⏳ *Initializing Download...*", parse_mode="Markdown")
+    status_msg = await query.message.reply_text("⏳ *Queue (অপেক্ষা করো)...*", parse_mode="Markdown")
 
     file_path        = None
     user_dl_dir      = None
     is_prem, _       = is_user_premium(user_id)
     quality_label    = query.data.replace("dl_", "").upper()
     is_audio         = query.data == "dl_audio"
-    download_success = False
 
-    try:
-        loop       = asyncio.get_running_loop()   # FIX: not get_event_loop
-        last_upd   = [0.0]
+    async with DOWNLOAD_LOCK:  # Render ফ্রি সার্ভারের জন্য concurrent download লিমিট ১ করা
+        try:
+            await status_msg.edit_text("⏳ *Initializing Download...*", parse_mode="Markdown")
+            loop     = asyncio.get_running_loop()
+            last_upd = [0.0]
 
-        def progress_hook(d: dict):
-            if d["status"] != "downloading":
-                return
-            now = loop.time()
-            if now - last_upd[0] < 2.5:
-                return
-            last_upd[0] = now
-            dl   = d.get("downloaded_bytes", 0) / 1_048_576
-            tot  = (d.get("total_bytes") or d.get("total_bytes_estimate") or 0) / 1_048_576
-            pct  = d.get("_percent_str", "?%").strip()
-            ram  = get_ram_usage_mb()
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    status_msg.edit_text(
-                        f"⏬ *Downloading...*\n\n"
-                        f"📊 Progress: `{pct}`\n"
-                        f"📁 Size: `{dl:.1f}MB / {tot:.1f}MB`\n"
-                        f"💾 RAM: `{ram:.0f}MB/500MB`",
-                        parse_mode="Markdown",
-                    ),
-                    loop,
-                )
-            except Exception:
-                pass   # FIX: swallow edit errors silently
+            def progress_hook(d: dict):
+                if d["status"] != "downloading":
+                    return
+                now = loop.time()
+                if now - last_upd[0] < 3.0: # Render ফ্রি সার্ভারে বারবার মেসেজ এডিট এড়িয়ে চলার জন্য interval
+                    return
+                last_upd[0] = now
+                dl   = d.get("downloaded_bytes", 0) / 1_048_576
+                tot  = (d.get("total_bytes") or d.get("total_bytes_estimate") or 0) / 1_048_576
+                pct  = d.get("_percent_str", "?%").strip()
+                ram  = get_ram_usage_mb()
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        status_msg.edit_text(
+                            f"⏬ *Downloading...*\n\n"
+                            f"📊 Progress: `{pct}`\n"
+                            f"📁 Size: `{dl:.1f}MB / {tot:.1f}MB`\n"
+                            f"💾 RAM: `{ram:.0f}MB/500MB`",
+                            parse_mode="Markdown",
+                        ),
+                        loop,
+                    )
+                except Exception:
+                    pass
 
-        user_dl_dir = os.path.join("downloads", str(user_id))
-        os.makedirs(user_dl_dir, exist_ok=True)
+            user_dl_dir = os.path.join("downloads", str(user_id))
+            os.makedirs(user_dl_dir, exist_ok=True)
 
-        ydl_opts = get_base_ydl_opts(
-            progress_hook=progress_hook,
-            download_dir=user_dl_dir,
-            is_premium_user=is_prem,
-        )
-        ydl_opts["format"] = get_format_string(query.data)
+            ydl_opts = get_base_ydl_opts(
+                progress_hook=progress_hook,
+                download_dir=user_dl_dir,
+                is_premium_user=is_prem,
+            )
+            ydl_opts["format"] = get_format_string(query.data)
 
-        if is_audio:
-            # FIX: only add FFmpeg postprocessor when ffmpeg is present
-            if _ffmpeg_dir():
-                ydl_opts["postprocessors"] = [{
-                    "key":             "FFmpegExtractAudio",
-                    "preferredcodec":  "mp3",
-                    "preferredquality":"192",
-                }]
-            else:
-                # fallback: download best audio-only without merge
-                ydl_opts["format"] = "bestaudio/best"
+            if is_audio:
+                if _ffmpeg_dir():
+                    ydl_opts["postprocessors"] = [{
+                        "key":             "FFmpegExtractAudio",
+                        "preferredcodec":  "mp3",
+                        "preferredquality":"192",
+                    }]
+                else:
+                    ydl_opts["format"] = "bestaudio/best"
 
-        def download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return find_downloaded_file(ydl, info, user_dl_dir, is_audio), info.get("title", "Media")
+            def download():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    return find_downloaded_file(ydl, info, user_dl_dir, is_audio), info.get("title", "Media")
 
-        async with DOWNLOAD_LOCK:   # FIX: concurrency cap
             file_path, title = await loop.run_in_executor(None, download)
 
-        # FIX: size check before upload
-        size_mb = os.path.getsize(file_path) / 1_048_576
-        if size_mb > TELEGRAM_UPLOAD_LIMIT_MB:
-            await status_msg.edit_text(
-                f"❌ File too large: `{size_mb:.1f}MB`\n"
-                f"Telegram limit: {TELEGRAM_UPLOAD_LIMIT_MB}MB\n"
-                "360p বা 480p দিয়ে আবার চেষ্টা করো।"
-            )
-            return
-
-        await status_msg.edit_text("📤 *Uploading to Telegram...*", parse_mode="Markdown")
-
-        # FIX: caption without parse_mode to avoid Markdown errors in titles
-        caption = f"{'🎵' if is_audio else '🎥'} {title}\n\nDownloaded via YouTube Bot"
-
-        with open(file_path, "rb") as f:
-            if is_audio:
-                await context.bot.send_audio(
-                    chat_id=query.message.chat_id,
-                    audio=f,
-                    title=title,
-                    caption=caption,
-                    reply_markup=main_kb(),
+            size_mb = os.path.getsize(file_path) / 1_048_576
+            if size_mb > TELEGRAM_UPLOAD_LIMIT_MB:
+                await status_msg.edit_text(
+                    f"❌ File too large: `{size_mb:.1f}MB`\n"
+                    f"Render & Telegram limit: {TELEGRAM_UPLOAD_LIMIT_MB}MB\n"
+                    "360p বা 480p দিয়ে আবার চেষ্টা করো।"
                 )
+                return
+
+            await status_msg.edit_text("📤 *Uploading to Telegram...*", parse_mode="Markdown")
+
+            caption = f"{'🎵' if is_audio else '🎥'} {title}\n\nDownloaded via YouTube Bot"
+
+            with open(file_path, "rb") as f:
+                if is_audio:
+                    await context.bot.send_audio(
+                        chat_id=query.message.chat_id,
+                        audio=f,
+                        title=title,
+                        caption=caption,
+                        reply_markup=main_kb(),
+                    )
+                else:
+                    await context.bot.send_video(
+                        chat_id=query.message.chat_id,
+                        video=f,
+                        caption=caption,
+                        reply_markup=main_kb(),
+                        supports_streaming=True,
+                    )
+
+            log_download(user_id, title, quality_label)
+
+            if not is_prem:
+                increment_user_quota(user_id)
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        except Exception:
+            logger.exception("Download failed for user %s", user_id)
+            raw = str(__import__("sys").exc_info()[1])
+
+            if "Requested format is not available" in raw:
+                msg = "এই quality-তে video পাওয়া যাচ্ছে না। অন্য quality try করো।"
+            elif "ffmpeg" in raw.lower() or "postprocessor" in raw.lower():
+                msg = "Server-এ FFmpeg পাওয়া যাচ্ছে না। MP3 ছাড়া অন্য format try করো।"
+            elif "Video unavailable" in raw or "Private video" in raw:
+                msg = "Video unavailable বা private।"
+            elif "age" in raw.lower() and ("restricted" in raw.lower() or "confirm" in raw.lower()):
+                msg = "Age-restricted video — download করা যাচ্ছে না।"
+            elif "Sign in to confirm" in raw:
+                msg = "YouTube verification চাইছে। কিছুক্ষণ পরে আবার চেষ্টা করো।"
+            elif "429" in raw:
+                msg = "YouTube rate limit। ১ মিনিট পরে try করো।"
+            elif "too large" in raw.lower() or "max_filesize" in raw.lower():
+                msg = f"File {MAX_FILE_SIZE_MB}MB-এর বেশি। কম quality ব্যবহার করো।"
+            elif "FileNotFoundError" in raw:
+                msg = "Download হয়েছে কিন্তু file খুঁজে পাচ্ছি না। আবার try করো।"
             else:
-                await context.bot.send_video(
-                    chat_id=query.message.chat_id,
-                    video=f,
-                    caption=caption,
-                    reply_markup=main_kb(),
-                    supports_streaming=True,
-                )
+                msg = f"`{raw[:200]}`"
 
-        download_success = True
-        log_download(user_id, title, quality_label)
+            try:
+                await status_msg.edit_text(f"❌ *Download Failed!*\n\n{msg}", parse_mode="Markdown")
+            except Exception:
+                pass
 
-        # FIX: quota only incremented on SUCCESS
-        if not is_prem:
-            increment_user_quota(user_id)
-
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
-    except Exception:
-        logger.exception("Download failed for user %s", user_id)
-        raw = str(__import__("sys").exc_info()[1])
-
-        if "Requested format is not available" in raw:
-            msg = "এই quality-তে video পাওয়া যাচ্ছে না। অন্য quality try করো।"
-        elif "ffmpeg" in raw.lower() or "postprocessor" in raw.lower():
-            msg = "Server-এ FFmpeg পাওয়া যাচ্ছে না। MP3 ছাড়া অন্য format try করো।"
-        elif "Video unavailable" in raw or "Private video" in raw:
-            msg = "Video unavailable বা private।"
-        elif "age" in raw.lower() and ("restricted" in raw.lower() or "confirm" in raw.lower()):
-            msg = "Age-restricted video — download করা যাচ্ছে না।"
-        elif "Sign in to confirm" in raw:
-            msg = "YouTube verification চাইছে। কিছুক্ষণ পরে আবার চেষ্টা করো।"
-        elif "429" in raw:
-            msg = "YouTube rate limit। ১ মিনিট পরে try করো।"
-        elif "too large" in raw.lower() or "max_filesize" in raw.lower():
-            msg = f"File {MAX_FILE_SIZE_MB}MB-এর বেশি। কম quality ব্যবহার করো।"
-        elif "FileNotFoundError" in raw:
-            msg = "Download হয়েছে কিন্তু file খুঁজে পাচ্ছি না। আবার try করো।"
-        else:
-            msg = f"`{raw[:200]}`"
-
-        try:
-            await status_msg.edit_text(f"❌ *Download Failed!*\n\n{msg}", parse_mode="Markdown")
-        except Exception:
-            pass
-
-    finally:
-        # FIX: only this user's files are deleted
-        try:
-            if file_path and os.path.isfile(file_path):
-                os.remove(file_path)
-            if user_dl_dir and os.path.isdir(user_dl_dir):
-                for name in os.listdir(user_dl_dir):
-                    p = os.path.join(user_dl_dir, name)
-                    if os.path.isfile(p):
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
-        except Exception:
-            logger.exception("Cleanup failed")
-        gc.collect()
+        finally:
+            # 🚀 RENDER CRITICAL FIX: ডাউনলোড সম্পূর্ণ হওয়া মাত্রই লোকাল ফাইল ও ফোল্ডার সম্পূর্ণ মুছে ফেলা
+            try:
+                if user_dl_dir and os.path.isdir(user_dl_dir):
+                    shutil.rmtree(user_dl_dir, ignore_errors=True)
+            except Exception:
+                logger.exception("Cleanup failed")
+            gc.collect()
 
 # ============================================================
 # MAIN
@@ -962,30 +943,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ============================================================
-# BUG FIX SUMMARY
-# ── Fixed ──────────────────────────────────────────────────
-# 1.  'skip':['hls','dash'] removed  → main download bug fixed
-# 2.  asyncio.get_running_loop()     → was get_event_loop()
-# 3.  Duplicate referral guard       → referral_log table added
-# 4.  Quota only on success          → failed download ≠ quota--
-# 5.  Caption without parse_mode     → no more Markdown parse errors
-# 6.  FFmpeg guard for MP3           → clear error if missing
-# 7.  File size check before upload  → Telegram 49MB limit
-# 8.  Progress hook exception swallowed → no crash on edit
-# 9.  User-specific download dirs    → no cross-user file conflict
-# 10. cleanup_old_files() (1hr TTL)  → safe, no active-dl wipe
-# 11. SQLite WAL + timeout + context → safe concurrent DB access
-# 12. Better URL regex               → youtu.be/music.youtube.com
-# 13. DOWNLOAD_LOCK Semaphore(2)     → max 2 concurrent downloads
-# 14. logger.exception() everywhere  → full traceback in logs
-# 15. find_downloaded_file() helper  → robust post-download detection
-# ── Unchanged ──────────────────────────────────────────────
-# referral system, premium system, force-join, admin commands,
-# quota, leaderboard, broadcast, MP3/360p/480p/720p/1080p,
-# all command names, all callback_data values, DB schema (additive only)
-# ── Run ────────────────────────────────────────────────────
-# python bot.py
-# ffmpeg -version
-# ============================================================
