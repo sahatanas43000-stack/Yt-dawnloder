@@ -4,6 +4,7 @@
 Developer / Owner Contact: @Devsahatanas
 Other Bot: @BomssssssssBot
 Features:
+  - YouTube Anti-Bot / Sign-In Bypass Fix (Updated player_client & Cookies support)
   - Force Channel Join Verification (@sahatanas, @sahatanass)
   - Video (360p, 480p, 720p, 1080p Premium) & Audio (MP3) extraction
   - Live progress update hook (Downloaded % & MBs)
@@ -61,6 +62,18 @@ SUPPORT_URL = "https://t.me/Devsahatanas"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/bot_data.db")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/downloads")
 PORT = int(os.environ.get("PORT", 10000))
+
+# Cookie path for YouTube bypass if provided in ENV
+YOUTUBE_COOKIES_RAW = os.environ.get("YOUTUBE_COOKIES", "").strip()
+COOKIE_FILE_PATH = "/tmp/youtube_cookies.txt"
+
+if YOUTUBE_COOKIES_RAW:
+    try:
+        with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(YOUTUBE_COOKIES_RAW)
+        logging.info("Custom YouTube cookies file created successfully.")
+    except Exception as e:
+        logging.error(f"Failed to create cookies file: {e}")
 
 MAX_DAILY_DOWNLOADS_FREE = 2
 MAX_FILE_SIZE_MB = 80  # Telegram upload safe limit for free tier servers
@@ -285,7 +298,7 @@ def main_inline_keyboard() -> InlineKeyboardMarkup:
     )
 
 # --------------------------------------------------------------------------- #
-# yt-dlp Configuration & Progress Tracker
+# yt-dlp Options & Bypass Settings
 # --------------------------------------------------------------------------- #
 
 YTDLP_BASE_OPTS = {
@@ -297,20 +310,24 @@ YTDLP_BASE_OPTS = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
+            "Chrome/127.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     },
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
+            "player_client": ["ios", "mweb", "tv_embedded", "android"],
             "skip": ["hls", "dash"],
         }
     },
-    "retries": 5,
-    "fragment_retries": 5,
+    "retries": 10,
+    "fragment_retries": 10,
 }
+
+# Add cookiefile option if cookie exists
+if os.path.exists(COOKIE_FILE_PATH):
+    YTDLP_BASE_OPTS["cookiefile"] = COOKIE_FILE_PATH
 
 def format_bytes(bytes_val):
     if not bytes_val:
@@ -449,7 +466,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     bot = context.bot
 
-    # Parse referral argument
     referred_by = 0
     if context.args and context.args[0].startswith("ref_"):
         try:
@@ -459,7 +475,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ensure_user(user.id, user.username or user.first_name, referred_by=referred_by)
 
-    # Force Channel Join Check
     is_joined = await check_force_join(bot, user.id)
     if not is_joined:
         await update.message.reply_text(
@@ -718,7 +733,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Check force channel join
     is_joined = await check_force_join(context.bot, user.id)
     if not is_joined:
         await message.reply_text(
@@ -769,7 +783,8 @@ async def start_download_process(status_msg, user, url: str, quality: str, conte
                 await set_status(status_msg, status_msg.chat_id, "⏱️ Timed out fetching video info.")
                 return
             except Exception as exc:
-                await set_status(status_msg, status_msg.chat_id, "❌ Video info extract kora jayni.")
+                logger.error("Extract info error: %s", exc)
+                await set_status(status_msg, status_msg.chat_id, "❌ Video info extract kora jayni. YouTube IP block issue.")
                 return
 
             if info.get("is_live"):
@@ -781,7 +796,6 @@ async def start_download_process(status_msg, user, url: str, quality: str, conte
                 await set_status(status_msg, status_msg.chat_id, f"📏 Video size max {MAX_DURATION_SECONDS // 60} min-er besi.")
                 return
 
-            # Format selection
             is_audio = False
             if quality == "mp3":
                 is_audio = True
@@ -888,25 +902,21 @@ def main():
 
     init_db()
 
-    # Flask background keep-alive server
     threading.Thread(target=run_flask, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # User Commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("redeem", redeem_command))
 
-    # Admin Commands
     application.add_handler(CommandHandler("add_premium", add_premium_command))
     application.add_handler(CommandHandler("remove_premium", remove_premium_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("post", post_command))
 
-    # Handlers
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
