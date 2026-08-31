@@ -13,9 +13,8 @@ A feature-rich, high-performance Telegram Bot built using **Python**, **python-t
 * 👥 **Referral System:** Free users can invite friends via unique referral links to earn extra download quotas.
 * 📊 **Daily Quota System:** SQLite-backed 2-downloads/24h limit for free users.
 * ⭐ **Premium Membership:** Custom admin command to grant unlimited downloads and 1080p access.
-* 🛡️ **Anti-Bot Bypass & Cookies:** Configured player clients and optional `cookies.txt` support to bypass YouTube IP blocks.
 * 📢 **Admin Broadcasting:** Broadcast text messages or forward media posts to all bot users.
-* 📦 **Server Protection:** Automatic file limit (100 MB) to protect free tier servers (e.g., Render) from RAM crashes.
+* 📦 **Server Protection:** Automatic file limit (80 MB) to protect free tier servers (e.g., Render) from RAM crashes.
 
 ---
 
