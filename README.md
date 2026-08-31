@@ -35,7 +35,7 @@ Set the following Environment Variables in your hosting environment (e.g., Rende
 
 | Command | Usage | Description |
 | :--- | :--- | :--- |
-| `/add_premium` | `/add_premium <user_id>` | Add a user to the Premium list |
+| `/add_premium` | `/add_premium <user_id> <1month><etc>` | Add a user to the Premium list |
 | `/remove_premium` | `/remove_premium <user_id>` | Remove a user from the Premium list |
 | `/stats` | `/stats` | View total users and premium members count |
 | `/broadcast` | `/broadcast <text>` | Send a text message to all users |
