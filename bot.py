@@ -237,17 +237,16 @@ def get_base_ydl_opts(download_dir: str = "downloads", quality: str = "best") ->
         "format": fmt,
         "merge_output_format": "mp4",
 
-        # ✅ TRICK 1: Android + TV client — cookies ছাড়াই বেশিরভাগ ভিডিও কাজ করে
+        # ✅ TRICK 1: ios + web client — সবচেয়ে বেশি কাজ করে cookies ছাড়া
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "android_vr", "tv_embedded"],
-                "player_skip": ["webpage", "js"],
+                "player_client": ["ios", "web"],
             }
         },
 
-        # ✅ TRICK 2: Android app এর মতো User-Agent — YouTube কম block করে
+        # ✅ TRICK 2: iOS app User-Agent — YouTube কম block করে
         "http_headers": {
-            "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+            "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
             "Accept-Language": "en-US,en;q=0.9",
         },
 
