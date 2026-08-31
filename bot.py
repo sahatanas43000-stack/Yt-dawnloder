@@ -88,6 +88,18 @@ def is_ram_safe() -> bool:
 # FIX: cleanup_memory এখন পুরো downloads folder মুছবে না
 def cleanup_memory():
     gc.collect()
+    # 1 ঘণ্টার বেশি পুরানো file delete করো — crash এর পর আটকে থাকা file
+    dl_folder = "downloads"
+    if os.path.exists(dl_folder):
+        now = datetime.now().timestamp()
+        for root, dirs, files in os.walk(dl_folder):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                try:
+                    if now - os.path.getmtime(fpath) > 3600:  # 1 ঘণ্টা
+                        os.remove(fpath)
+                except Exception:
+                    pass
 
 # ============================================================
 # DB HELPERS
@@ -998,6 +1010,8 @@ def main():
         first=60
     )
 
+    # Startup এ পুরানো file clean করো
+    cleanup_memory()
     logger.info("Bot started successfully!")
     application.run_polling(
         drop_pending_updates=True,
