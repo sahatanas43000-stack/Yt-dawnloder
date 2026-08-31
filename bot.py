@@ -231,8 +231,8 @@ def _ffmpeg_dir() -> str | None:
     return os.path.dirname(p) if p else None
 
 def get_base_ydl_opts(download_dir: str = "downloads", quality: str = "best") -> dict:
-    # FIX: format string সহজ করা — "Requested format not available" ঠিক
     if quality == "mp3":
+        # MP3: শুধু audio
         fmt = "bestaudio/best"
         postprocessors = [{
             "key": "FFmpegExtractAudio",
@@ -240,11 +240,11 @@ def get_base_ydl_opts(download_dir: str = "downloads", quality: str = "best") ->
             "preferredquality": "192",
         }]
     elif quality in ("360", "480", "720", "1080"):
-        # সহজ format — fallback সহ, যেকোনো ভিডিওতে কাজ করবে
-        fmt = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        # ✅ FINAL FIX: একদম সহজ — শুধু height filter, বাকি সব "best" fallback
+        fmt = f"best[height<={quality}]/best"
         postprocessors = []
     else:
-        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        fmt = "best"
         postprocessors = []
 
     opts: dict = {
@@ -255,16 +255,15 @@ def get_base_ydl_opts(download_dir: str = "downloads", quality: str = "best") ->
         "format": fmt,
         "merge_output_format": "mp4",
 
-        # FIX: ios client সবচেয়ে ভালো — cookies ছাড়াই কাজ করে
+        # ✅ mweb client — সবচেয়ে সহজ, format সব দেয়, cookies লাগে না
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "web"],
+                "player_client": ["mweb", "ios", "web"],
             }
         },
 
-        # FIX: iOS User-Agent
         "http_headers": {
-            "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         },
 
