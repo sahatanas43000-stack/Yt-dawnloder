@@ -47,12 +47,6 @@ REFERRAL_THRESHOLD_FOR_UNLIMITED = 100
 TELEGRAM_UPLOAD_LIMIT_MB       = 49
 DOWNLOAD_LOCK                  = asyncio.Semaphore(2)
 
-# ── Markdown escape ────────────────────────────────────────
-_MD_SPECIAL = re.compile(r'([_*\[\]()~`>#+\-=|{}.!\\])')
-
-def md_escape(text: str) -> str:
-    return _MD_SPECIAL.sub(r'\\\1', str(text))
-
 # ── YouTube URL validation ─────────────────────────────────
 _YT_RE = re.compile(
     r'(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)'
@@ -116,38 +110,14 @@ def register_user(user_id: int, username: str = None, first_name: str = None):
             (username, first_name, user_id),
         )
 
-def add_referral(referrer_id: int, referee_id: int) -> bool:
-    with _conn() as db:
-        try:
-            db.execute(
-                "INSERT INTO referral_log (referrer_id, referee_id) VALUES (?,?)",
-                (referrer_id, referee_id),
-            )
-            db.execute(
-                "UPDATE users SET referral_count = referral_count + 1 WHERE user_id=?",
-                (referrer_id,),
-            )
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
 def is_user_banned(user_id: int) -> bool:
     with _conn() as db:
         row = db.execute("SELECT is_banned FROM users WHERE user_id=?", (user_id,)).fetchone()
     return bool(row and row[0])
 
-def ban_user(user_id: int):
-    with _conn() as db:
-        db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        db.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (user_id,))
-
-def unban_user(user_id: int):
-    with _conn() as db:
-        db.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (user_id,))
-
 def is_user_premium(user_id: int) -> tuple[bool, str]:
     if user_id == ADMIN_ID:
-        return True, "Admin (Unlimited)"
+        return True, "Admin"
     with _conn() as db:
         row = db.execute(
             "SELECT referral_count, premium_until FROM users WHERE user_id=?", (user_id,)
@@ -156,7 +126,7 @@ def is_user_premium(user_id: int) -> tuple[bool, str]:
         return False, "Free User"
     ref_count, prem_until = row
     if ref_count >= REFERRAL_THRESHOLD_FOR_UNLIMITED or prem_until == "UNLIMITED":
-        return True, "Unlimited Premium"
+        return True, "Unlimited Access"
     if prem_until:
         try:
             exp = datetime.strptime(prem_until, "%Y-%m-%d %H:%M:%S")
@@ -178,13 +148,6 @@ def get_user_stats(user_id: int):
         ).fetchone()
     return (q[0] if q else 0), (ref[0] if ref else 0)
 
-def get_total_downloads(user_id: int) -> int:
-    with _conn() as db:
-        row = db.execute(
-            "SELECT COUNT(*) FROM download_log WHERE user_id=?", (user_id,)
-        ).fetchone()
-    return row[0] if row else 0
-
 def increment_user_quota(user_id: int):
     today = str(datetime.now().date())
     with _conn() as db:
@@ -201,21 +164,6 @@ def log_download(user_id: int, title: str, quality: str):
             (user_id, title, quality),
         )
 
-def get_all_users():
-    with _conn() as db:
-        rows = db.execute("SELECT user_id FROM users WHERE is_banned=0").fetchall()
-    return [r[0] for r in rows]
-
-def get_top_referrers(limit=10):
-    with _conn() as db:
-        rows = db.execute(
-            """SELECT user_id, first_name, username, referral_count
-               FROM users WHERE referral_count > 0
-               ORDER BY referral_count DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
-    return rows
-
 def set_premium_db(user_id: int, duration_str: str):
     duration_str = duration_str.lower().strip()
     with _conn() as db:
@@ -230,70 +178,36 @@ def set_premium_db(user_id: int, duration_str: str):
             db.execute("UPDATE users SET premium_until=? WHERE user_id=?", (exp, user_id))
             return f"{days} Days (Expires: {exp})"
 
-def remove_premium_db(user_id: int):
+def get_all_users():
     with _conn() as db:
-        db.execute("UPDATE users SET premium_until=NULL WHERE user_id=?", (user_id,))
+        rows = db.execute("SELECT user_id FROM users WHERE is_banned=0").fetchall()
+    return [r[0] for r in rows]
 
 # ============================================================
-# RAM / DISK helpers
+# KEYBOARDS (আগের মতো নিখুঁত সাজানো)
 # ============================================================
-def get_ram_usage_mb() -> float:
-    return psutil.Process(os.getpid()).memory_info().rss / 1_048_576
-
-def is_ram_safe() -> bool:
-    return get_ram_usage_mb() < RAM_LIMIT_MB
-
-def cleanup_old_files():
-    dl_folder = "downloads"
-    if not os.path.exists(dl_folder):
-        return
-    cutoff = datetime.now().timestamp() - 3600
-    for root, _, files in os.walk(dl_folder):
-        for fname in files:
-            fpath = os.path.join(root, fname)
-            try:
-                if os.path.getmtime(fpath) < cutoff:
-                    os.remove(fpath)
-            except Exception:
-                pass
-    gc.collect()
-
-# ============================================================
-# KEYBOARDS WITH AI BUTTON
-# ============================================================
-def force_join_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel 1", url=CHANNEL_1_URL)],
-        [InlineKeyboardButton("📢 Join Channel 2", url=CHANNEL_2_URL)],
-        [InlineKeyboardButton("🤖 AI Assistant", callback_data="ai_feature")],
-    ])
-
 def main_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 AI Assistant", callback_data="ai_feature")],
         [InlineKeyboardButton("🛠️ Contact Admin", url="https://t.me/Devsahatanas")],
         [InlineKeyboardButton("⚡ Any Video Downloader Bot", url=OTHER_BOT_URL)],
     ])
 
 # ============================================================
-# yt-dlp helpers
+# yt-dlp helpers (ফিক্সড ডাউনলোড অপশন)
 # ============================================================
 def _ffmpeg_dir() -> str | None:
     p = shutil.which("ffmpeg")
     return os.path.dirname(p) if p else None
 
-def get_base_ydl_opts(
-    progress_hook=None,
-    download_dir: str = "downloads",
-    is_premium_user: bool = False,
-) -> dict:
+def get_base_ydl_opts(download_dir: str = "downloads") -> dict:
     opts: dict = {
         "outtmpl": os.path.join(download_dir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        # ফিক্সড: যেকোনো সাপোর্টেড ফরম্যাট অটো পিক করবে
+        "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "web"],
@@ -301,13 +215,8 @@ def get_base_ydl_opts(
         },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
         },
     }
-    if not is_premium_user:
-        opts["max_filesize"] = f"{MAX_FILE_SIZE_MB}M"
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
     if os.path.exists("cookies.txt"):
         opts["cookiefile"] = "cookies.txt"
     fd = _ffmpeg_dir()
@@ -315,7 +224,7 @@ def get_base_ydl_opts(
         opts["ffmpeg_location"] = fd
     return opts
 
-def find_downloaded_file(ydl, info: dict, download_dir: str, is_audio: bool):
+def find_downloaded_file(ydl, info: dict, download_dir: str):
     filename = ydl.prepare_filename(info)
     if os.path.exists(filename):
         return filename
@@ -331,7 +240,7 @@ def find_downloaded_file(ydl, info: dict, download_dir: str, is_audio: bool):
     ]
     if files:
         return max(files, key=os.path.getmtime)
-    raise FileNotFoundError("Downloaded file not found after extraction")
+    raise FileNotFoundError("Downloaded file not found")
 
 # ============================================================
 # COMMANDS
@@ -349,24 +258,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_dl, ref_count = get_user_stats(user.id)
     is_prem, status_str = is_user_premium(user.id)
 
-    badge      = "👑 Admin"   if user.id == ADMIN_ID else ("⭐ Premium" if is_prem else "🆓 Free")
-    status_line = "♾️ Unlimited Access" if user.id == ADMIN_ID else (f"✅ {status_str}" if is_prem else f"📥 Today: {today_dl}/2 downloads used")
+    badge      = "👑 Admin" if user.id == ADMIN_ID else ("⭐ Premium" if is_prem else "🆓 Free")
+    status_line = "♾️ Unlimited Access" if is_prem else f"📥 {today_dl}/2 downloads used"
+
+    # রেফারেল বার তৈরি (১০টি ঘরে ১০০ জন রেফারেল)
+    filled_blocks = min(10, ref_count // 10)
+    progress_bar = "█" * filled_blocks + "░" * (10 - filled_blocks)
+
+    msg_text = (
+        f"🎬 *YouTube Downloader Bot*\n"
+        f"───────────────────\n\n"
+        f"👋 *Welcome, {user.first_name}!*\n\n"
+        f"💳 *Account:* `{badge}`\n"
+        f"📊 *Status:* `{status_line}`\n"
+        f"⏰ *Today's Downloads:* `{today_dl}/{'∞' if is_prem else '2'}`\n\n"
+        f"───────────────────\n"
+        f"👥 *Referral Progress*\n"
+        f"`[{progress_bar}]` `{ref_count}/100`\n"
+        f"🎯 *100 জন আনলে Lifetime Unlimited!*\n\n"
+        f"🔗 *তোমার Referral Link:*\n`{ref_link}`\n\n"
+        f"───────────────────\n"
+        f"📩 *যে কোনো YouTube link পাঠাও!*\n"
+        f"⬇️ *360p • 480p • 720p • 1080p • MP3*\n\n"
+        f"📌 */help — সব commands দেখো*"
+    )
 
     await update.message.reply_text(
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🎬 *YouTube Downloader Bot*\n"
-        f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👋 *Welcome, {user.first_name}!*\n\n"
-        f"┌ 🏷️ *Account:* `{badge}`\n"
-        f"├ 📊 *Status:* `{status_line}`\n"
-        f"└ 🕐 *Today's Downloads:* `{today_dl}/{'∞' if is_prem else '2'}`\n\n"
-        f"🔗 *তোমার Referral Link:*\n`{ref_link}`\n\n"
-        f"📩 *যেকোনো YouTube link পাঠাও!*",
+        msg_text,
         parse_mode="Markdown",
         reply_markup=main_kb(),
     )
 
-# ── NEW /premium COMMAND ────────────────────────────────────
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ এই কমান্ডটি শুধু Admin ব্যবহার করতে পারবে।")
@@ -374,12 +296,7 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "⚠️ **ব্যবহার পদ্ধতি:**\n"
-            "`/premium <user_id> <1days|2days|30days|unlimited>`\n\n"
-            "**উদাহরণ:**\n"
-            "`/premium 123456789 1days`\n"
-            "`/premium 123456789 30days`\n"
-            "`/premium 123456789 unlimited`",
+            "⚠️ **ব্যবহার পদ্ধতি:**\n`/premium <user_id> <1days|2days|30days|unlimited>`",
             parse_mode="Markdown"
         )
         return
@@ -388,26 +305,17 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = int(context.args[0])
         duration = context.args[1]
     except ValueError:
-        await update.message.reply_text("❌ অনুগ্রহ করে সঠিক User ID প্রদান করুন।")
+        await update.message.reply_text("❌ সঠিক User ID লিখুন।")
         return
 
     res = set_premium_db(target_id, duration)
-    await update.message.reply_text(f"✅ User `{target_id}` updated to Premium!\nDetails: `{res}`", parse_mode="Markdown")
-
-    try:
-        await context.bot.send_message(
-            target_id,
-            f"🎉 **অভিনন্দন!**\n\nআপনার অ্যাকাউন্টে **Premium Access** একটিভ করা হয়েছে।\nমেয়াদ/স্ট্যাটাস: `{res}`",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
+    await update.message.reply_text(f"✅ User `{target_id}` updated!\nStatus: `{res}`", parse_mode="Markdown")
 
 async def post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ এই কমান্ডটি শুধু Admin ব্যবহার করতে পারবে।")
         return
-    
+
     if not context.args:
         await update.message.reply_text("⚠️ ব্যবহার পদ্ধতি: `/post আপনার মেসেজটি লিখুন`", parse_mode="Markdown")
         return
@@ -418,13 +326,12 @@ async def post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sent = 0
     failed = 0
-
     for uid in users:
         try:
             await context.bot.send_message(chat_id=uid, text=broadcast_text, parse_mode="Markdown")
             sent += 1
             await asyncio.sleep(0.05)
-        except Exception as e:
+        except Exception:
             failed += 1
 
     await status_msg.edit_text(
@@ -432,20 +339,8 @@ async def post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-# ── AI BUTTON HANDLER ──────────────────────────────────────
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "ai_feature":
-        await query.message.reply_text(
-            "🤖 **AI Assistant Feature**\n\n"
-            "আমাদের AI বট সার্ভিসটি ব্যবহার করতে যোগাযোগের চেষ্টা করুন বা পরবর্তীতে আপডেট পান।",
-            parse_mode="Markdown"
-        )
-
 # ============================================================
-# MESSAGE HANDLER & DIRECT DOWNLOADER
+# MESSAGE HANDLER & DOWNLOADING
 # ============================================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -466,7 +361,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_prem and today_dl >= 2:
         await update.message.reply_text(
-            "🚫 *Daily Limit Reached!*\n\nFree users: দিনে *2টা* download।",
+            "🚫 *Daily Limit Reached!*\n\nFree users: দিনে *2টি* download পেতে পারবেন।",
             parse_mode="Markdown",
             reply_markup=main_kb(),
         )
@@ -474,8 +369,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("⏳ *ডাউনলোড প্রসেস শুরু হচ্ছে...*", parse_mode="Markdown")
 
-    file_path        = None
-    user_dl_dir      = None
+    file_path   = None
+    user_dl_dir = None
 
     try:
         loop = asyncio.get_running_loop()
@@ -483,22 +378,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_dl_dir = os.path.join("downloads", str(user.id))
         os.makedirs(user_dl_dir, exist_ok=True)
 
-        ydl_opts = get_base_ydl_opts(
-            download_dir=user_dl_dir,
-            is_premium_user=is_prem,
-        )
+        ydl_opts = get_base_ydl_opts(download_dir=user_dl_dir)
 
         def download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(text, download=True)
-                return find_downloaded_file(ydl, info, user_dl_dir, is_audio=False), info.get("title", "Video")
+                return find_downloaded_file(ydl, info, user_dl_dir), info.get("title", "Video")
 
         async with DOWNLOAD_LOCK:
             file_path, title = await loop.run_in_executor(None, download)
 
         size_mb = os.path.getsize(file_path) / 1_048_576
         if size_mb > TELEGRAM_UPLOAD_LIMIT_MB:
-            await status_msg.edit_text(f"❌ File too large: `{size_mb:.1f}MB`")
+            await status_msg.edit_text(f"❌ File too large: `{size_mb:.1f}MB` (Telegram limit 50MB)")
             return
 
         await status_msg.edit_text("📤 *Uploading to Telegram...*", parse_mode="Markdown")
@@ -514,7 +406,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 supports_streaming=True,
             )
 
-        log_download(user.id, title, "DIRECT_BEST")
+        log_download(user.id, title, "BEST")
 
         if not is_prem:
             increment_user_quota(user.id)
@@ -527,7 +419,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Download failed for user %s", user.id)
         try:
-            await status_msg.edit_text(f"❌ *Download Failed!*", parse_mode="Markdown")
+            await status_msg.edit_text("❌ *Download Failed!* ভিডিওর লিঙ্কটি সাপোর্ট করছে না বা ফরম্যাট উপলব্ধ নেই।", parse_mode="Markdown")
         except Exception:
             pass
 
@@ -556,7 +448,6 @@ def main():
         return
 
     os.makedirs("downloads", exist_ok=True)
-    cleanup_old_files()
 
     app = (
         ApplicationBuilder()
@@ -568,11 +459,9 @@ def main():
         .build()
     )
 
-    # Register Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("post", post_cmd))
-    app.add_handler(CommandHandler("premium", premium_cmd))  # NEW /premium COMMAND
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CommandHandler("premium", premium_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot started successfully!")
