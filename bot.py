@@ -184,7 +184,7 @@ def get_all_users():
     return [r[0] for r in rows]
 
 # ============================================================
-# KEYBOARDS (আগের মতো নিখুঁত সাজানো)
+# KEYBOARDS
 # ============================================================
 def main_kb():
     return InlineKeyboardMarkup([
@@ -192,36 +192,89 @@ def main_kb():
         [InlineKeyboardButton("⚡ Any Video Downloader Bot", url=OTHER_BOT_URL)],
     ])
 
+def quality_kb():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📱 360p", callback_data="q_360"),
+            InlineKeyboardButton("📺 480p", callback_data="q_480"),
+        ],
+        [
+            InlineKeyboardButton("🎬 720p HD", callback_data="q_720"),
+            InlineKeyboardButton("🖥️ 1080p FHD", callback_data="q_1080"),
+        ],
+        [
+            InlineKeyboardButton("🎵 MP3 Audio", callback_data="q_mp3"),
+        ],
+    ])
+
 # ============================================================
-# yt-dlp helpers (ফিক্সড ডাউনলোড অপশন)
+# yt-dlp helpers — BUG FIX: quality parameter যোগ করা হয়েছে
 # ============================================================
 def _ffmpeg_dir() -> str | None:
     p = shutil.which("ffmpeg")
     return os.path.dirname(p) if p else None
 
-def get_base_ydl_opts(download_dir: str = "downloads") -> dict:
+def get_base_ydl_opts(download_dir: str = "downloads", quality: str = "best") -> dict:
+    if quality == "mp3":
+        fmt = "bestaudio/best"
+        postprocessors = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+    elif quality in ("360", "480", "720", "1080"):
+        fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        postprocessors = []
+    else:
+        fmt = "bestvideo+bestaudio/best"
+        postprocessors = []
+
     opts: dict = {
         "outtmpl": os.path.join(download_dir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # ফিক্সড: যেকোনো সাপোর্টেড ফরম্যাট অটো পিক করবে
-        "format": "bestvideo+bestaudio/best",
+        "format": fmt,
         "merge_output_format": "mp4",
+
+        # ✅ TRICK 1: Android + TV client — cookies ছাড়াই বেশিরভাগ ভিডিও কাজ করে
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["android", "android_vr", "tv_embedded"],
+                "player_skip": ["webpage", "js"],
             }
         },
+
+        # ✅ TRICK 2: Android app এর মতো User-Agent — YouTube কম block করে
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+            "Accept-Language": "en-US,en;q=0.9",
         },
+
+        # ✅ TRICK 3: Rate limit এড়াতে sleep
+        "sleep_interval": 1,
+        "max_sleep_interval": 3,
+
+        # ✅ TRICK 4: Throttle এড়াতে
+        "throttledratelimit": 100000,
+
+        # ✅ TRICK 5: Retry করবে error হলে
+        "retries": 5,
+        "fragment_retries": 5,
+        "skip_unavailable_fragments": True,
     }
+
+    if postprocessors:
+        opts["postprocessors"] = postprocessors
+
+    # cookies.txt থাকলে ব্যবহার করবে, না থাকলেও চলবে
     if os.path.exists("cookies.txt"):
         opts["cookiefile"] = "cookies.txt"
+
     fd = _ffmpeg_dir()
     if fd:
         opts["ffmpeg_location"] = fd
+
     return opts
 
 def find_downloaded_file(ydl, info: dict, download_dir: str):
@@ -261,7 +314,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     badge      = "👑 Admin" if user.id == ADMIN_ID else ("⭐ Premium" if is_prem else "🆓 Free")
     status_line = "♾️ Unlimited Access" if is_prem else f"📥 {today_dl}/2 downloads used"
 
-    # রেফারেল বার তৈরি (১০টি ঘরে ১০০ জন রেফারেল)
     filled_blocks = min(10, ref_count // 10)
     progress_bar = "█" * filled_blocks + "░" * (10 - filled_blocks)
 
@@ -340,7 +392,7 @@ async def post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ============================================================
-# MESSAGE HANDLER & DOWNLOADING
+# MESSAGE HANDLER — BUG FIX: সরাসরি ডাউনলোড না করে quality keyboard দেখায়
 # ============================================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -356,8 +408,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please send a valid YouTube link.")
         return
 
-    is_prem, status_str = is_user_premium(user.id)
-    today_dl, ref_count = get_user_stats(user.id)
+    is_prem, _ = is_user_premium(user.id)
+    today_dl, _ = get_user_stats(user.id)
 
     if not is_prem and today_dl >= 2:
         await update.message.reply_text(
@@ -367,18 +419,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status_msg = await update.message.reply_text("⏳ *ডাউনলোড প্রসেস শুরু হচ্ছে...*", parse_mode="Markdown")
+    # BUG FIX: URL সেভ করে quality keyboard দেখাও
+    context.user_data["yt_url"] = text
 
-    file_path   = None
+    await update.message.reply_text(
+        "✅ *লিঙ্ক পাওয়া গেছে!*\n\n🎯 কোন quality তে ডাউনলোড করবেন?",
+        parse_mode="Markdown",
+        reply_markup=quality_kb(),
+    )
+
+# ============================================================
+# QUALITY CALLBACK — BUG FIX: নতুন handler যোগ করা হয়েছে
+# ============================================================
+async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    quality = query.data.replace("q_", "")  # "360", "480", "720", "1080", "mp3"
+    text = context.user_data.get("yt_url")
+
+    if not text:
+        await query.edit_message_text("❌ URL আর নেই, নতুন লিঙ্ক পাঠান।")
+        return
+
+    is_prem, _ = is_user_premium(user.id)
+    today_dl, _ = get_user_stats(user.id)
+
+    if not is_prem and today_dl >= 2:
+        await query.edit_message_text(
+            "🚫 *Daily Limit Reached!*\n\nFree users: দিনে *2টি* download পাবেন।",
+            parse_mode="Markdown",
+            reply_markup=main_kb(),
+        )
+        return
+
+    quality_label = "🎵 MP3" if quality == "mp3" else f"🎬 {quality}p"
+    status_msg = await query.edit_message_text(
+        f"⏳ *{quality_label} ডাউনলোড হচ্ছে...*\nঅপেক্ষা করুন।",
+        parse_mode="Markdown",
+    )
+
+    file_path = None
     user_dl_dir = None
 
     try:
         loop = asyncio.get_running_loop()
-
         user_dl_dir = os.path.join("downloads", str(user.id))
         os.makedirs(user_dl_dir, exist_ok=True)
 
-        ydl_opts = get_base_ydl_opts(download_dir=user_dl_dir)
+        ydl_opts = get_base_ydl_opts(download_dir=user_dl_dir, quality=quality)
 
         def download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -390,23 +480,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         size_mb = os.path.getsize(file_path) / 1_048_576
         if size_mb > TELEGRAM_UPLOAD_LIMIT_MB:
-            await status_msg.edit_text(f"❌ File too large: `{size_mb:.1f}MB` (Telegram limit 50MB)")
+            await status_msg.edit_text(
+                f"❌ File too large: `{size_mb:.1f}MB` (Telegram limit 50MB)\n"
+                f"ছোট quality বেছে নিন।",
+                parse_mode="Markdown",
+            )
             return
 
-        await status_msg.edit_text("📤 *Uploading to Telegram...*", parse_mode="Markdown")
-
-        caption = f"🎥 {title}\n\nDownloaded via YouTube Bot"
+        await status_msg.edit_text("📤 *Telegram এ পাঠানো হচ্ছে...*", parse_mode="Markdown")
+        caption = f"🎥 {title}\n\n📊 Quality: {quality_label}\nDownloaded via YouTube Bot"
 
         with open(file_path, "rb") as f:
-            await context.bot.send_video(
-                chat_id=user.id,
-                video=f,
-                caption=caption,
-                reply_markup=main_kb(),
-                supports_streaming=True,
-            )
+            if quality == "mp3":
+                await context.bot.send_audio(
+                    chat_id=user.id,
+                    audio=f,
+                    caption=caption,
+                    reply_markup=main_kb(),
+                )
+            else:
+                await context.bot.send_video(
+                    chat_id=user.id,
+                    video=f,
+                    caption=caption,
+                    reply_markup=main_kb(),
+                    supports_streaming=True,
+                )
 
-        log_download(user.id, title, "BEST")
+        log_download(user.id, title, quality.upper())
 
         if not is_prem:
             increment_user_quota(user.id)
@@ -418,8 +519,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("Download failed for user %s", user.id)
+        err_str = str(e).lower()
+
+        if "private" in err_str or "sign in" in err_str:
+            reason = "ভিডিওটি Private — Login ছাড়া ডাউনলোড হবে না।"
+        elif "copyright" in err_str or "removed" in err_str:
+            reason = "ভিডিওটি Copyright বা Remove হয়ে গেছে।"
+        elif "age" in err_str:
+            reason = "Age-restricted ভিডিও — ডাউনলোড সম্ভব না।"
+        elif "unavailable" in err_str:
+            reason = "ভিডিওটি আপনার দেশে বা সার্ভারে পাওয়া যাচ্ছে না।"
+        elif "throttl" in err_str or "429" in err_str:
+            reason = "YouTube rate limit করেছে — কিছুক্ষণ পর চেষ্টা করুন।"
+        else:
+            reason = "অন্য quality বা অন্য link দিয়ে চেষ্টা করুন।"
+
         try:
-            await status_msg.edit_text("❌ *Download Failed!* ভিডিওর লিঙ্কটি সাপোর্ট করছে না বা ফরম্যাট উপলব্ধ নেই।", parse_mode="Markdown")
+            await status_msg.edit_text(
+                f"❌ *Download Failed!*\n\n⚠️ {reason}",
+                parse_mode="Markdown",
+            )
         except Exception:
             pass
 
@@ -440,7 +559,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gc.collect()
 
 # ============================================================
-# MAIN
+# MAIN — BUG FIX: quality_callback handler যোগ করা হয়েছে
 # ============================================================
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
@@ -462,6 +581,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("post", post_cmd))
     app.add_handler(CommandHandler("premium", premium_cmd))
+    # BUG FIX: Quality callback handler যোগ করা হয়েছে
+    app.add_handler(CallbackQueryHandler(quality_callback, pattern="^q_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot started successfully!")
