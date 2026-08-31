@@ -4,14 +4,14 @@
 Developer / Owner Contact: @Devsahatanas
 Other Bot: @BomssssssssBot
 Features:
-  - YouTube Anti-Bot / Sign-In Bypass Fix (Updated player_client & Cookies support)
+  - Fixed YouTube Anti-Bot Bypass with automatic local & env cookies loading
+  - Removed duplicate Flask thread to fix port 10000 conflict
   - Force Channel Join Verification (@sahatanas, @sahatanass)
   - Video (360p, 480p, 720p, 1080p Premium) & Audio (MP3) extraction
   - Live progress update hook (Downloaded % & MBs)
   - Referral System (100 invites = Auto Lifetime Free Premium)
   - Prominent display & button for Other Bot (@BomssssssssBot)
   - Admin Commands (/add_premium, /remove_premium, /stats, /broadcast, /post)
-  - Integrated Flask ping server for 24/7 uptime on Render/Railway
 """
 
 import os
@@ -21,10 +21,8 @@ import time
 import logging
 import sqlite3
 import asyncio
-import threading
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask
 import yt_dlp
 
 from telegram import (
@@ -61,23 +59,31 @@ SUPPORT_URL = "https://t.me/Devsahatanas"
 
 DB_PATH = os.environ.get("DB_PATH", "/tmp/bot_data.db")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/downloads")
-PORT = int(os.environ.get("PORT", 10000))
 
-# Cookie path for YouTube bypass if provided in ENV
+# --------------------------------------------------------------------------- #
+# Cookies Detection Logic (Local file OR Env Variable)
+# --------------------------------------------------------------------------- #
+
+COOKIE_FILE_PATH = None
+LOCAL_COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 YOUTUBE_COOKIES_RAW = os.environ.get("YOUTUBE_COOKIES", "").strip()
-COOKIE_FILE_PATH = "/tmp/youtube_cookies.txt"
 
-if YOUTUBE_COOKIES_RAW:
+if os.path.exists(LOCAL_COOKIE_FILE) and os.path.getsize(LOCAL_COOKIE_FILE) > 10:
+    COOKIE_FILE_PATH = LOCAL_COOKIE_FILE
+    logging.info("Local cookies.txt file detected successfully.")
+elif YOUTUBE_COOKIES_RAW:
+    TMP_COOKIE_PATH = "/tmp/youtube_cookies.txt"
     try:
-        with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
+        with open(TMP_COOKIE_PATH, "w", encoding="utf-8") as f:
             f.write(YOUTUBE_COOKIES_RAW)
-        logging.info("Custom YouTube cookies file created successfully.")
+        COOKIE_FILE_PATH = TMP_COOKIE_PATH
+        logging.info("Env YOUTUBE_COOKIES created successfully at /tmp/youtube_cookies.txt.")
     except Exception as e:
-        logging.error(f"Failed to create cookies file: {e}")
+        logging.error("Failed to write env cookies file: %s", e)
 
 MAX_DAILY_DOWNLOADS_FREE = 2
-MAX_FILE_SIZE_MB = 80  # Telegram upload safe limit for free tier servers
-MAX_DURATION_SECONDS = 40 * 60  # 40 minutes safety limit
+MAX_FILE_SIZE_MB = 80  # Telegram upload safe limit
+MAX_DURATION_SECONDS = 40 * 60  # 40 minutes limit
 MAX_CONCURRENT_DOWNLOADS = 1
 
 YOUTUBE_URL_REGEX = re.compile(
@@ -94,19 +100,6 @@ logger = logging.getLogger("yt_downloader_bot")
 
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 active_status_text = {}
-
-# --------------------------------------------------------------------------- #
-# Flask Keep-Alive Server (For Render / Web Service Pings)
-# --------------------------------------------------------------------------- #
-
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def home():
-    return "Bot is running perfectly 24/7!"
-
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
 
 # --------------------------------------------------------------------------- #
 # Database Layer
@@ -298,36 +291,38 @@ def main_inline_keyboard() -> InlineKeyboardMarkup:
     )
 
 # --------------------------------------------------------------------------- #
-# yt-dlp Options & Bypass Settings
+# Dynamic yt-dlp Configuration
 # --------------------------------------------------------------------------- #
 
-YTDLP_BASE_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "socket_timeout": 30,
-    "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/127.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["ios", "mweb", "tv_embedded", "android"],
-            "skip": ["hls", "dash"],
-        }
-    },
-    "retries": 10,
-    "fragment_retries": 10,
-}
+def get_ytdlp_opts() -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/127.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+                "skip": ["hls", "dash"],
+            }
+        },
+        "retries": 10,
+        "fragment_retries": 10,
+    }
 
-# Add cookiefile option if cookie exists
-if os.path.exists(COOKIE_FILE_PATH):
-    YTDLP_BASE_OPTS["cookiefile"] = COOKIE_FILE_PATH
+    if COOKIE_FILE_PATH and os.path.exists(COOKIE_FILE_PATH):
+        opts["cookiefile"] = COOKIE_FILE_PATH
+
+    return opts
 
 def format_bytes(bytes_val):
     if not bytes_val:
@@ -336,7 +331,8 @@ def format_bytes(bytes_val):
     return f"{mb:.2f} MB"
 
 def _extract_info_sync(url: str) -> dict:
-    opts = {**YTDLP_BASE_OPTS, "skip_download": True}
+    opts = get_ytdlp_opts()
+    opts["skip_download"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -364,14 +360,12 @@ def _download_sync(url: str, output_template: str, format_spec: str, is_audio: b
                     set_status(status_msg, chat_id, text), loop
                 )
 
-    opts = {
-        **YTDLP_BASE_OPTS,
-        "format": format_spec,
-        "outtmpl": output_template,
-        "restrictfilenames": True,
-        "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
-        "progress_hooks": [progress_hook],
-    }
+    opts = get_ytdlp_opts()
+    opts["format"] = format_spec
+    opts["outtmpl"] = output_template
+    opts["restrictfilenames"] = True
+    opts["max_filesize"] = MAX_FILE_SIZE_MB * 1024 * 1024
+    opts["progress_hooks"] = [progress_hook]
 
     if is_audio:
         opts["postprocessors"] = [
@@ -901,8 +895,6 @@ def main():
         raise RuntimeError("BOT_TOKEN environment variable missing!")
 
     init_db()
-
-    threading.Thread(target=run_flask, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
