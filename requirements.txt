@@ -1,5 +1,6 @@
-python-telegram-bot[job-queue]>=21.0.1
-yt-dlp>=2024.12.13
+
+python-telegram-bot[job-queue]>=21.0
+yt-dlp>=2024.8.6
 Flask>=3.0.0
 gunicorn>=21.2.0
-psutil
+psutil>=5.9.0
